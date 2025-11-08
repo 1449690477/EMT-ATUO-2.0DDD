@@ -906,6 +906,10 @@ class NoTrickDecryptController:
             self.gui.on_no_trick_macro_missing(entry)
             return 0.0
 
+        base_name = entry.get("base_name") or os.path.splitext(entry.get("name", ""))[0]
+        macro_label = f"{self.gui.log_prefix} 无巧手解密 {base_name}.json"
+        log(f"{self.gui.log_prefix} 无巧手解密：回放 {base_name}.json 宏。")
+
         start = time.perf_counter()
         self.gui.on_no_trick_macro_start(entry, score)
 
@@ -914,7 +918,7 @@ class NoTrickDecryptController:
 
         play_macro(
             macro_path,
-            f"{self.gui.log_prefix} 无巧手解密 {entry.get('name')}",
+            macro_label,
             0.0,
             0.0,
             interrupt_on_exit=False,
@@ -978,10 +982,9 @@ class NoTrickDecryptController:
                 return base
 
         for name in sorted(candidates, key=sort_key):
+            base_name = os.path.splitext(name)[0]
             png_path = os.path.join(self.game_dir, name)
-            json_path = os.path.join(
-                self.game_dir, os.path.splitext(name)[0] + ".json"
-            )
+            json_path = os.path.join(self.game_dir, base_name + ".json")
             try:
                 data = np.fromfile(png_path, dtype=np.uint8)
                 tpl = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
@@ -993,6 +996,7 @@ class NoTrickDecryptController:
                     "name": name,
                     "png_path": png_path,
                     "json_path": json_path,
+                    "base_name": base_name,
                     "template": tpl,
                 }
             )
