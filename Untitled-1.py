@@ -1120,6 +1120,8 @@ class MainGUI:
     def __init__(self, root, cfg):
         self.root = root
 
+        self._init_styles()
+
         self.hotkey_var = tk.StringVar(value=cfg.get("hotkey", "1"))
         self.wait_var = tk.StringVar(value=str(cfg.get("wait_seconds", 8.0)))
         self.macro_a_var = tk.StringVar(value=cfg.get("macro_a_path", ""))
@@ -1129,53 +1131,205 @@ class MainGUI:
 
         self._build_ui()
 
+    _style_initialized = False
+
+    def _init_styles(self):
+        if MainGUI._style_initialized:
+            return
+
+        style = ttk.Style(self.root)
+        try:
+            if style.theme_use() not in {"clam", "vista"}:
+                style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        background = "#eef1f8"
+        card_background = "#ffffff"
+        accent = "#4c6ef5"
+
+        style.configure("MainBackground.TFrame", background=background)
+        style.configure("Card.TFrame", background=card_background)
+        style.configure("Card.TLabelframe", background=card_background, borderwidth=1, relief="solid")
+        style.configure(
+            "Card.TLabelframe.Label",
+            background=card_background,
+            foreground="#1f2b5d",
+            font=("Microsoft YaHei", 11, "bold"),
+            padding=(2, 0, 2, 2),
+        )
+        style.configure("Header.TFrame", background=background)
+        style.configure("HeaderTitle.TLabel", background=background, foreground="#1f2b5d", font=("Microsoft YaHei", 16, "bold"))
+        style.configure("HeaderSubtitle.TLabel", background=background, foreground="#5c6c8c", font=("Microsoft YaHei", 10))
+        style.configure(
+            "Accent.TButton",
+            foreground="#ffffff",
+            background=accent,
+            padding=(12, 8),
+            borderwidth=0,
+            relief="flat",
+        )
+        style.map(
+            "Accent.TButton",
+            background=[("!disabled", accent), ("pressed", "#364fc7"), ("active", "#5f7cfa")],
+        )
+
+        MainGUI._style_initialized = True
+
     def _build_ui(self):
-        top = tk.Frame(self.root)
-        top.pack(fill="x", padx=10, pady=5)
+        if hasattr(self.root, "configure"):
+            try:
+                self.root.configure(style="MainBackground.TFrame")
+            except tk.TclError:
+                pass
 
-        tk.Label(top, text="热键:").grid(row=0, column=0, sticky="e")
-        tk.Entry(top, textvariable=self.hotkey_var, width=15).grid(row=0, column=1, sticky="w")
-        ttk.Button(top, text="录制热键", command=self.capture_hotkey).grid(row=0, column=2, padx=3)
-        ttk.Button(top, text="保存配置", command=self.save_cfg).grid(row=0, column=3, padx=3)
+        container = ttk.Frame(self.root, padding=(18, 18, 18, 18), style="MainBackground.TFrame")
+        container.pack(fill="both", expand=True)
+        container.grid_columnconfigure(0, weight=1)
+        container.grid_columnconfigure(1, weight=2)
+        container.grid_rowconfigure(1, weight=1)
 
-        tk.Label(top, text="烟花等待(秒):").grid(row=1, column=0, sticky="e")
-        tk.Entry(top, textvariable=self.wait_var, width=8).grid(row=1, column=1, sticky="w")
-        tk.Checkbutton(top, text="自动循环", variable=self.auto_loop_var).grid(row=1, column=2, sticky="w")
+        header = ttk.Frame(container, style="Header.TFrame")
+        header.grid(row=0, column=0, columnspan=2, sticky="ew")
+        header.grid_columnconfigure(0, weight=1)
 
-        frm2 = tk.LabelFrame(self.root, text="宏设置")
-        frm2.pack(fill="x", padx=10, pady=5)
+        ttk.Label(header, text="赛琪大烟花自动化", style="HeaderTitle.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Label(
+            header,
+            text="设置宏脚本与热键，快速执行整套流程。",
+            style="HeaderSubtitle.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
 
-        tk.Label(frm2, text="A 宏（靠近大烟花）:").grid(row=0, column=0, sticky="e")
-        tk.Entry(frm2, textvariable=self.macro_a_var, width=60).grid(row=0, column=1, sticky="w")
-        ttk.Button(frm2, text="浏览…", command=self.choose_a).grid(row=0, column=2, padx=3)
+        control_panel = ttk.Frame(container, style="MainBackground.TFrame")
+        control_panel.grid(row=1, column=0, sticky="nsew", padx=(0, 16))
+        control_panel.grid_columnconfigure(0, weight=1)
+        control_panel.grid_rowconfigure(3, weight=1)
 
-        tk.Label(frm2, text="B 宏（撤退 / 退图前）:").grid(row=1, column=0, sticky="e")
-        tk.Entry(frm2, textvariable=self.macro_b_var, width=60).grid(row=1, column=1, sticky="w")
-        ttk.Button(frm2, text="浏览…", command=self.choose_b).grid(row=1, column=2, padx=3)
+        base_settings = ttk.LabelFrame(
+            control_panel,
+            text="基础设置",
+            padding=(16, 14, 16, 12),
+            style="Card.TLabelframe",
+        )
+        base_settings.grid(row=0, column=0, sticky="ew")
+        for i in range(4):
+            base_settings.grid_columnconfigure(i, weight=0)
+        base_settings.grid_columnconfigure(1, weight=1)
 
-        frm3 = tk.Frame(self.root)
-        frm3.pack(padx=10, pady=5)
+        ttk.Label(base_settings, text="热键:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(base_settings, textvariable=self.hotkey_var, width=18).grid(
+            row=0, column=1, sticky="ew", padx=(8, 8)
+        )
+        ttk.Button(base_settings, text="录制热键", command=self.capture_hotkey).grid(
+            row=0, column=2, padx=(0, 6)
+        )
+        ttk.Button(base_settings, text="保存配置", command=self.save_cfg).grid(row=0, column=3)
 
-        ttk.Button(frm3, text="开始监听热键", command=self.start_listen).grid(row=0, column=0, padx=3)
-        ttk.Button(frm3, text="停止", command=self.stop_listen).grid(row=0, column=1, padx=3)
-        ttk.Button(frm3, text="只执行一轮", command=self.run_once).grid(row=0, column=2, padx=3)
+        ttk.Label(base_settings, text="烟花等待(秒):").grid(
+            row=1, column=0, sticky="w", pady=(12, 0)
+        )
+        ttk.Entry(base_settings, textvariable=self.wait_var, width=10).grid(
+            row=1, column=1, sticky="w", padx=(8, 8), pady=(12, 0)
+        )
+        ttk.Checkbutton(
+            base_settings,
+            text="自动循环",
+            variable=self.auto_loop_var,
+        ).grid(row=1, column=2, columnspan=2, sticky="w", pady=(12, 0))
 
-        frm4 = tk.LabelFrame(self.root, text="日志")
-        frm4.pack(fill="both", expand=True, padx=10, pady=5)
+        macro_settings = ttk.LabelFrame(
+            control_panel,
+            text="宏脚本",
+            padding=(16, 14, 16, 12),
+            style="Card.TLabelframe",
+        )
+        macro_settings.grid(row=1, column=0, sticky="ew", pady=(16, 0))
+        macro_settings.grid_columnconfigure(1, weight=1)
 
-        self.log_text = tk.Text(frm4, height=10)
-        self.log_text.pack(side="left", fill="both", expand=True)
-        sb = tk.Scrollbar(frm4, command=self.log_text.yview)
-        sb.pack(side="right", fill="y")
+        ttk.Label(macro_settings, text="A 宏（靠近大烟花）:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(macro_settings, textvariable=self.macro_a_var).grid(
+            row=0, column=1, sticky="ew", padx=(8, 8)
+        )
+        ttk.Button(macro_settings, text="浏览…", command=self.choose_a).grid(row=0, column=2)
+
+        ttk.Label(macro_settings, text="B 宏（撤退 / 退图前）:").grid(
+            row=1, column=0, sticky="w", pady=(12, 0)
+        )
+        ttk.Entry(macro_settings, textvariable=self.macro_b_var).grid(
+            row=1, column=1, sticky="ew", padx=(8, 8), pady=(12, 0)
+        )
+        ttk.Button(macro_settings, text="浏览…", command=self.choose_b).grid(
+            row=1, column=2, pady=(12, 0)
+        )
+
+        action_panel = ttk.LabelFrame(
+            control_panel,
+            text="快捷操作",
+            padding=(16, 12, 16, 16),
+            style="Card.TLabelframe",
+        )
+        action_panel.grid(row=2, column=0, sticky="ew", pady=(16, 0))
+        action_panel.grid_columnconfigure((0, 1, 2), weight=1)
+
+        ttk.Button(
+            action_panel,
+            text="开始监听热键",
+            command=self.start_listen,
+            style="Accent.TButton",
+        ).grid(row=0, column=0, padx=4, pady=4, sticky="ew")
+        ttk.Button(action_panel, text="停止", command=self.stop_listen).grid(
+            row=0, column=1, padx=4, pady=4, sticky="ew"
+        )
+        ttk.Button(action_panel, text="只执行一轮", command=self.run_once).grid(
+            row=0, column=2, padx=4, pady=4, sticky="ew"
+        )
+
+        display_panel = ttk.Frame(container, style="MainBackground.TFrame")
+        display_panel.grid(row=1, column=1, sticky="nsew")
+        display_panel.grid_columnconfigure(0, weight=1)
+        display_panel.grid_rowconfigure(0, weight=1)
+        display_panel.grid_rowconfigure(1, weight=0)
+
+        log_frame = ttk.LabelFrame(
+            display_panel,
+            text="运行日志",
+            padding=(12, 12, 12, 8),
+            style="Card.TLabelframe",
+        )
+        log_frame.grid(row=0, column=0, sticky="nsew")
+        log_frame.grid_columnconfigure(0, weight=1)
+        log_frame.grid_rowconfigure(0, weight=1)
+
+        self.log_text = tk.Text(
+            log_frame,
+            height=14,
+            relief="flat",
+            background="#f8f9ff",
+            borderwidth=0,
+        )
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(log_frame, orient="vertical", command=self.log_text.yview)
+        sb.grid(row=0, column=1, sticky="ns")
         self.log_text.config(yscrollcommand=sb.set)
 
+        progress_frame = ttk.LabelFrame(
+            display_panel,
+            text="执行进度",
+            padding=(16, 14, 16, 16),
+            style="Card.TLabelframe",
+        )
+        progress_frame.grid(row=1, column=0, sticky="ew", pady=(16, 0))
+        progress_frame.grid_columnconfigure(0, weight=1)
+
         self.progress = ttk.Progressbar(
-            self.root,
+            progress_frame,
             variable=self.progress_var,
             maximum=100.0,
             mode="determinate",
         )
-        self.progress.pack(fill="x", padx=10, pady=5)
+        self.progress.grid(row=0, column=0, sticky="ew")
 
     def log(self, msg: str):
         ts = time.strftime("[%H:%M:%S] ")
