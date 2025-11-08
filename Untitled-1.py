@@ -15,6 +15,7 @@ import copy
 import queue
 import random
 import importlib.util
+from typing import Optional
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -254,6 +255,14 @@ def report_progress(p: float):
 
 
 GOAL_STYLE_INITIALIZED = False
+MODERN_STYLE_INITIALIZED = False
+
+CARD_BORDER_COLOR = "#d7dbf6"
+CARD_OUTER_BG = "#eef1ff"
+CARD_CONTENT_BG = "#ffffff"
+CARD_HEADER_FG = "#273564"
+CARD_TEXT_FG = "#2b2f3a"
+CARD_NOTICE_FG = "#d64545"
 
 
 def ensure_goal_progress_style():
@@ -273,6 +282,113 @@ def ensure_goal_progress_style():
         GOAL_STYLE_INITIALIZED = True
     except Exception:
         pass
+
+
+def ensure_modern_style():
+    """Initialize shared modern UI styles for buttons and frames."""
+
+    global MODERN_STYLE_INITIALIZED
+    if MODERN_STYLE_INITIALIZED:
+        return
+    try:
+        style = ttk.Style()
+        try:
+            if style.theme_use() in ("classic", "default"):
+                style.theme_use("clam")
+        except Exception:
+            pass
+
+        style.configure(
+            "Accent.TButton",
+            font=("Microsoft YaHei", 10, "bold"),
+            padding=(14, 6),
+            foreground="#ffffff",
+            background="#4a64ff",
+        )
+        style.map(
+            "Accent.TButton",
+            background=[
+                ("pressed", "#334bd6"),
+                ("active", "#5a73ff"),
+                ("disabled", "#9fa5c7"),
+            ],
+            foreground=[("disabled", "#ffffff")],
+        )
+
+        style.configure(
+            "Card.TButton",
+            padding=(10, 5),
+            background="#e6ebff",
+        )
+        style.map(
+            "Card.TButton",
+            background=[
+                ("pressed", "#cbd5ff"),
+                ("active", "#dfe5ff"),
+            ],
+        )
+
+        style.configure("Card.TLabel", background=CARD_CONTENT_BG, foreground=CARD_TEXT_FG)
+        MODERN_STYLE_INITIALIZED = True
+    except Exception:
+        pass
+
+
+def create_card(parent, title: Optional[str] = None, padding=(14, 12)):
+    """Create a styled card container with optional title.
+
+    Returns a tuple of (outer_frame, inner_frame).
+    """
+
+    outer = tk.Frame(
+        parent,
+        bg=CARD_OUTER_BG,
+        bd=0,
+        highlightthickness=1,
+        highlightbackground=CARD_BORDER_COLOR,
+    )
+    content = tk.Frame(outer, bg=CARD_CONTENT_BG, bd=0)
+    if title:
+        header = tk.Label(
+            outer,
+            text=title,
+            bg=CARD_OUTER_BG,
+            fg=CARD_HEADER_FG,
+            font=("Microsoft YaHei", 10, "bold"),
+        )
+        header.pack(anchor="w", padx=padding[0], pady=(padding[1], 4))
+        content.pack(
+            fill="both",
+            expand=True,
+            padx=padding[0],
+            pady=(0, padding[1]),
+        )
+    else:
+        content.pack(
+            fill="both",
+            expand=True,
+            padx=padding[0],
+            pady=padding,
+        )
+    return outer, content
+
+
+def create_card_label(parent, text="", **kwargs):
+    if "bg" not in kwargs:
+        kwargs["bg"] = parent.cget("bg")
+    if "fg" not in kwargs:
+        kwargs["fg"] = CARD_TEXT_FG
+    return tk.Label(parent, text=text, **kwargs)
+
+
+def create_card_checkbutton(parent, text="", variable=None, **kwargs):
+    if "bg" not in kwargs:
+        kwargs["bg"] = parent.cget("bg")
+    if "activebackground" not in kwargs:
+        kwargs["activebackground"] = kwargs["bg"]
+    if "selectcolor" not in kwargs:
+        kwargs["selectcolor"] = "#dce2ff"
+    return tk.Checkbutton(parent, text=text, variable=variable, **kwargs)
 
 
 def load_preview_image(path: str, max_size: int = 72):
@@ -1130,52 +1246,78 @@ class MainGUI:
         self._build_ui()
 
     def _build_ui(self):
-        top = tk.Frame(self.root)
-        top.pack(fill="x", padx=10, pady=5)
+        ensure_modern_style()
 
-        tk.Label(top, text="热键:").grid(row=0, column=0, sticky="e")
+        base_card, top = create_card(self.root, "基础设置")
+        base_card.pack(fill="x", padx=10, pady=5)
+        top_bg = top.cget("bg")
+
+        create_card_label(top, text="热键:", bg=top_bg).grid(row=0, column=0, sticky="e")
         tk.Entry(top, textvariable=self.hotkey_var, width=15).grid(row=0, column=1, sticky="w")
-        ttk.Button(top, text="录制热键", command=self.capture_hotkey).grid(row=0, column=2, padx=3)
-        ttk.Button(top, text="保存配置", command=self.save_cfg).grid(row=0, column=3, padx=3)
+        ttk.Button(top, text="录制热键", command=self.capture_hotkey, style="Card.TButton").grid(
+            row=0, column=2, padx=3
+        )
+        ttk.Button(top, text="保存配置", command=self.save_cfg, style="Card.TButton").grid(
+            row=0, column=3, padx=3
+        )
 
-        tk.Label(top, text="烟花等待(秒):").grid(row=1, column=0, sticky="e")
+        create_card_label(top, text="烟花等待(秒):", bg=top_bg).grid(row=1, column=0, sticky="e")
         tk.Entry(top, textvariable=self.wait_var, width=8).grid(row=1, column=1, sticky="w")
-        tk.Checkbutton(top, text="自动循环", variable=self.auto_loop_var).grid(row=1, column=2, sticky="w")
+        create_card_checkbutton(top, text="自动循环", variable=self.auto_loop_var).grid(
+            row=1, column=2, sticky="w"
+        )
 
-        frm2 = tk.LabelFrame(self.root, text="宏设置")
-        frm2.pack(fill="x", padx=10, pady=5)
+        macro_card, frm2 = create_card(self.root, "宏设置")
+        macro_card.pack(fill="x", padx=10, pady=5)
 
-        tk.Label(frm2, text="A 宏（靠近大烟花）:").grid(row=0, column=0, sticky="e")
+        frm2_bg = frm2.cget("bg")
+        create_card_label(frm2, text="A 宏（靠近大烟花）：", bg=frm2_bg).grid(
+            row=0, column=0, sticky="e"
+        )
         tk.Entry(frm2, textvariable=self.macro_a_var, width=60).grid(row=0, column=1, sticky="w")
-        ttk.Button(frm2, text="浏览…", command=self.choose_a).grid(row=0, column=2, padx=3)
+        ttk.Button(frm2, text="浏览…", command=self.choose_a, style="Card.TButton").grid(
+            row=0, column=2, padx=3
+        )
 
-        tk.Label(frm2, text="B 宏（撤退 / 退图前）:").grid(row=1, column=0, sticky="e")
+        create_card_label(frm2, text="B 宏（撤退 / 退图前）：", bg=frm2_bg).grid(
+            row=1, column=0, sticky="e"
+        )
         tk.Entry(frm2, textvariable=self.macro_b_var, width=60).grid(row=1, column=1, sticky="w")
-        ttk.Button(frm2, text="浏览…", command=self.choose_b).grid(row=1, column=2, padx=3)
+        ttk.Button(frm2, text="浏览…", command=self.choose_b, style="Card.TButton").grid(
+            row=1, column=2, padx=3
+        )
 
-        frm3 = tk.Frame(self.root)
-        frm3.pack(padx=10, pady=5)
+        ctrl_card, frm3 = create_card(self.root)
+        ctrl_card.pack(padx=10, pady=5)
 
-        ttk.Button(frm3, text="开始监听热键", command=self.start_listen).grid(row=0, column=0, padx=3)
-        ttk.Button(frm3, text="停止", command=self.stop_listen).grid(row=0, column=1, padx=3)
-        ttk.Button(frm3, text="只执行一轮", command=self.run_once).grid(row=0, column=2, padx=3)
+        ttk.Button(frm3, text="开始监听热键", command=self.start_listen, style="Accent.TButton").grid(
+            row=0, column=0, padx=3
+        )
+        ttk.Button(frm3, text="停止", command=self.stop_listen, style="Card.TButton").grid(
+            row=0, column=1, padx=3
+        )
+        ttk.Button(frm3, text="只执行一轮", command=self.run_once, style="Card.TButton").grid(
+            row=0, column=2, padx=3
+        )
 
-        frm4 = tk.LabelFrame(self.root, text="日志")
-        frm4.pack(fill="both", expand=True, padx=10, pady=5)
+        log_card, frm4 = create_card(self.root, "日志")
+        log_card.pack(fill="both", expand=True, padx=10, pady=5)
 
-        self.log_text = tk.Text(frm4, height=10)
+        self.log_text = tk.Text(frm4, height=10, bg="#f9f9ff", relief="flat")
         self.log_text.pack(side="left", fill="both", expand=True)
         sb = tk.Scrollbar(frm4, command=self.log_text.yview)
         sb.pack(side="right", fill="y")
         self.log_text.config(yscrollcommand=sb.set)
 
+        progress_card, progress_inner = create_card(self.root, "执行进度")
+        progress_card.pack(fill="x", padx=10, pady=5)
         self.progress = ttk.Progressbar(
-            self.root,
+            progress_inner,
             variable=self.progress_var,
             maximum=100.0,
             mode="determinate",
         )
-        self.progress.pack(fill="x", padx=10, pady=5)
+        self.progress.pack(fill="x")
 
     def log(self, msg: str):
         ts = time.strftime("[%H:%M:%S] ")
@@ -1343,6 +1485,7 @@ class FragmentFarmGUI:
             self.no_trick_progress_var = tk.DoubleVar(value=0.0)
             self.no_trick_image_ref = None
             self.no_trick_controller = None
+            self.no_trick_status_card = None
             self.no_trick_status_frame = None
             self.no_trick_status_label = None
             self.no_trick_image_label = None
@@ -1353,6 +1496,7 @@ class FragmentFarmGUI:
             self.no_trick_progress_var = None
             self.no_trick_image_ref = None
             self.no_trick_controller = None
+            self.no_trick_status_card = None
             self.no_trick_status_frame = None
             self.no_trick_status_label = None
             self.no_trick_image_label = None
@@ -1386,88 +1530,113 @@ class FragmentFarmGUI:
 
     # ---- UI ----
     def _build_ui(self):
-        tip_top = tk.Label(
-            self.parent,
+        ensure_modern_style()
+
+        banner_card, banner_inner = create_card(self.parent, "模式说明")
+        banner_card.pack(fill="x", padx=10, pady=5)
+        create_card_label(
+            banner_inner,
             text="只能刷『探险无尽血清』，请使用高练度的大范围水母角色！",
-            fg="red",
+            fg=CARD_NOTICE_FG,
             font=("Microsoft YaHei", 10, "bold"),
-        )
-        tip_top.pack(fill="x", padx=10, pady=3)
+        ).pack(fill="x")
 
-        top = tk.Frame(self.parent)
-        top.pack(fill="x", padx=10, pady=5)
-
-        tk.Label(top, text="总波数:").grid(row=0, column=0, sticky="e")
+        settings_card, top = create_card(self.parent, "基础设置")
+        settings_card.pack(fill="x", padx=10, pady=5)
+        top_bg = top.cget("bg")
+        create_card_label(top, text="总波数:", bg=top_bg).grid(row=0, column=0, sticky="e")
         tk.Entry(top, textvariable=self.wave_var, width=6).grid(row=0, column=1, sticky="w", padx=3)
-        tk.Label(top, text="（默认 10 波）").grid(row=0, column=2, sticky="w")
+        create_card_label(top, text="（默认 10 波）", bg=top_bg).grid(row=0, column=2, sticky="w")
 
-        tk.Label(top, text="局内超时(秒):").grid(row=0, column=3, sticky="e")
+        create_card_label(top, text="局内超时(秒):", bg=top_bg).grid(row=0, column=3, sticky="e")
         tk.Entry(top, textvariable=self.timeout_var, width=6).grid(row=0, column=4, sticky="w", padx=3)
-        tk.Label(top, text="（防卡死判定）").grid(row=0, column=5, sticky="w")
+        create_card_label(top, text="（防卡死判定）", bg=top_bg).grid(row=0, column=5, sticky="w")
 
-        tk.Checkbutton(
-            top,
-            text="开启循环",
-            variable=self.auto_loop_var,
-        ).grid(row=0, column=6, sticky="w", padx=10)
+        create_card_checkbutton(top, text="开启循环", variable=self.auto_loop_var).grid(
+            row=0, column=6, sticky="w", padx=10
+        )
 
-        hotkey_frame = tk.Frame(self.parent)
-        hotkey_frame.pack(fill="x", padx=10, pady=5)
-        self.hotkey_label_widget = tk.Label(
-            hotkey_frame, text=f"刷{self.product_short_label}热键:"
+        hotkey_card, hotkey_frame = create_card(self.parent, "热键设置")
+        hotkey_card.pack(fill="x", padx=10, pady=5)
+        hotkey_bg = hotkey_frame.cget("bg")
+        self.hotkey_label_widget = create_card_label(
+            hotkey_frame, text=f"刷{self.product_short_label}热键:", bg=hotkey_bg
         )
         self.hotkey_label_widget.pack(side="left")
         tk.Entry(hotkey_frame, textvariable=self.hotkey_var, width=20).pack(side="left", padx=5)
-        ttk.Button(hotkey_frame, text="录制热键", command=self._capture_hotkey).pack(side="left", padx=3)
-        ttk.Button(hotkey_frame, text="保存设置", command=self._save_settings).pack(side="left", padx=3)
+        ttk.Button(
+            hotkey_frame, text="录制热键", command=self._capture_hotkey, style="Card.TButton"
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            hotkey_frame, text="保存设置", command=self._save_settings, style="Card.TButton"
+        ).pack(side="left", padx=3)
 
         if self.enable_no_trick_decrypt:
-            toggle_frame = tk.Frame(self.parent)
-            toggle_frame.pack(fill="x", padx=10, pady=(0, 5))
-            tk.Checkbutton(
-                toggle_frame,
+            toggle_card, toggle_inner = create_card(self.parent)
+            toggle_card.pack(fill="x", padx=10, pady=(0, 5))
+            create_card_checkbutton(
+                toggle_inner,
                 text="开启无巧手解密",
                 variable=self.no_trick_var,
                 command=self._on_no_trick_toggle,
             ).pack(anchor="w")
 
-        self.frame_letters = tk.LabelFrame(
+        letters_card, letters_inner = create_card(
             self.parent,
-            text=f"{self.letter_label}选择（来自 {self.letters_dir_hint}/）",
+            title=f"{self.letter_label}选择（来自 {self.letters_dir_hint}/）",
         )
-        self.frame_letters.pack(fill="both", expand=True, padx=10, pady=5)
+        letters_card.pack(fill="both", expand=True, padx=10, pady=5)
+        self.frame_letters = letters_inner
 
-        self.letters_grid = tk.Frame(self.frame_letters)
+        letters_bg = self.frame_letters.cget("bg")
+        self.letters_grid = tk.Frame(self.frame_letters, bg=letters_bg)
         self.letters_grid.pack(fill="both", expand=True, padx=5, pady=5)
 
         self.selected_label_var = tk.StringVar(value=f"当前未选择{self.letter_label}")
-        self.selected_label_widget = tk.Label(
-            self.frame_letters, textvariable=self.selected_label_var, fg="#0080ff"
+        self.selected_label_widget = create_card_label(
+            self.frame_letters,
+            textvariable=self.selected_label_var,
+            fg="#0080ff",
+            bg=letters_bg,
         )
         self.selected_label_widget.pack(anchor="w", padx=5, pady=3)
 
-        frame_macros = tk.LabelFrame(self.parent, text="地图宏脚本（mapA / mapB）")
-        frame_macros.pack(fill="x", padx=10, pady=5)
+        macros_card, frame_macros = create_card(self.parent, "地图宏脚本（mapA / mapB）")
+        macros_card.pack(fill="x", padx=10, pady=5)
         frame_macros.grid_columnconfigure(1, weight=1)
+        macros_bg = frame_macros.cget("bg")
 
-        tk.Label(frame_macros, text="mapA 宏:").grid(row=0, column=0, sticky="e")
-        tk.Entry(frame_macros, textvariable=self.macro_a_var, width=50).grid(row=0, column=1, sticky="w", padx=3)
-        ttk.Button(frame_macros, text="浏览…", command=self._choose_macro_a).grid(row=0, column=2, padx=3)
+        create_card_label(frame_macros, text="mapA 宏:", bg=macros_bg).grid(
+            row=0, column=0, sticky="e"
+        )
+        tk.Entry(frame_macros, textvariable=self.macro_a_var, width=50).grid(
+            row=0, column=1, sticky="w", padx=3
+        )
+        ttk.Button(
+            frame_macros, text="浏览…", command=self._choose_macro_a, style="Card.TButton"
+        ).grid(row=0, column=2, padx=3)
 
-        tk.Label(frame_macros, text="mapB 宏:").grid(row=1, column=0, sticky="e")
-        tk.Entry(frame_macros, textvariable=self.macro_b_var, width=50).grid(row=1, column=1, sticky="w", padx=3)
-        ttk.Button(frame_macros, text="浏览…", command=self._choose_macro_b).grid(row=1, column=2, padx=3)
+        create_card_label(frame_macros, text="mapB 宏:", bg=macros_bg).grid(
+            row=1, column=0, sticky="e"
+        )
+        tk.Entry(frame_macros, textvariable=self.macro_b_var, width=50).grid(
+            row=1, column=1, sticky="w", padx=3
+        )
+        ttk.Button(
+            frame_macros, text="浏览…", command=self._choose_macro_b, style="Card.TButton"
+        ).grid(row=1, column=2, padx=3)
 
         if self.enable_no_trick_decrypt:
-            self.no_trick_status_frame = tk.LabelFrame(self.parent, text="无巧手解密状态")
-            status_inner = tk.Frame(self.no_trick_status_frame)
-            status_inner.pack(fill="x", padx=5, pady=5)
-
-            self.no_trick_status_label = tk.Label(
-                status_inner,
+            self.no_trick_status_card, self.no_trick_status_frame = create_card(
+                self.parent, "无巧手解密状态"
+            )
+            status_bg = self.no_trick_status_frame.cget("bg")
+            self.no_trick_status_label = create_card_label(
+                self.no_trick_status_frame,
                 textvariable=self.no_trick_status_var,
                 anchor="w",
                 justify="left",
+                bg=status_bg,
             )
             self.no_trick_status_label.pack(fill="x", anchor="w")
 
@@ -1487,63 +1656,88 @@ class FragmentFarmGUI:
             )
             self.no_trick_progress.pack(fill="x", padx=10, pady=(0, 8))
 
-        self.stats_frame = tk.LabelFrame(
-            self.parent, text=f"{self.product_label}统计（实时）"
+        stats_card, self.stats_frame = create_card(
+            self.parent, title=f"{self.product_label}统计（实时）"
         )
-        self.stats_frame.pack(fill="x", padx=10, pady=5)
+        stats_card.pack(fill="x", padx=10, pady=5)
+        stats_bg = self.stats_frame.cget("bg")
 
-        self.stat_image_label = tk.Label(self.stats_frame, relief="sunken")
+        self.stat_image_label = tk.Label(self.stats_frame, relief="sunken", bg=stats_bg)
         self.stat_image_label.grid(row=0, column=0, rowspan=3, padx=5, pady=5)
 
-        self.current_entity_label = tk.Label(
-            self.stats_frame, text=f"当前{self.entity_label}："
+        self.current_entity_label = create_card_label(
+            self.stats_frame, text=f"当前{self.entity_label}：", bg=stats_bg
         )
         self.current_entity_label.grid(row=0, column=1, sticky="e")
-        tk.Label(self.stats_frame, textvariable=self.stat_name_var).grid(row=0, column=2, sticky="w")
+        create_card_label(self.stats_frame, textvariable=self.stat_name_var, bg=stats_bg).grid(
+            row=0, column=2, sticky="w"
+        )
 
-        self.total_product_label = tk.Label(
-            self.stats_frame, text=f"累计{self.product_label}："
+        self.total_product_label = create_card_label(
+            self.stats_frame, text=f"累计{self.product_label}：", bg=stats_bg
         )
         self.total_product_label.grid(row=1, column=1, sticky="e")
-        tk.Label(
+        create_card_label(
             self.stats_frame,
             textvariable=self.fragment_count_var,
             font=("Microsoft YaHei", 12, "bold"),
             fg="#ff6600",
+            bg=stats_bg,
         ).grid(row=1, column=2, sticky="w")
 
-        tk.Label(self.stats_frame, text="运行时间：").grid(row=0, column=3, sticky="e")
-        tk.Label(self.stats_frame, textvariable=self.time_str_var).grid(row=0, column=4, sticky="w")
+        create_card_label(self.stats_frame, text="运行时间：", bg=stats_bg).grid(
+            row=0, column=3, sticky="e"
+        )
+        create_card_label(self.stats_frame, textvariable=self.time_str_var, bg=stats_bg).grid(
+            row=0, column=4, sticky="w"
+        )
 
-        tk.Label(self.stats_frame, text="平均掉落：").grid(row=1, column=3, sticky="e")
-        tk.Label(self.stats_frame, textvariable=self.rate_str_var).grid(row=1, column=4, sticky="w")
+        create_card_label(self.stats_frame, text="平均掉落：", bg=stats_bg).grid(
+            row=1, column=3, sticky="e"
+        )
+        create_card_label(self.stats_frame, textvariable=self.rate_str_var, bg=stats_bg).grid(
+            row=1, column=4, sticky="w"
+        )
 
-        tk.Label(self.stats_frame, text="效率：").grid(row=2, column=3, sticky="e")
-        tk.Label(self.stats_frame, textvariable=self.eff_str_var).grid(row=2, column=4, sticky="w")
+        create_card_label(self.stats_frame, text="效率：", bg=stats_bg).grid(
+            row=2, column=3, sticky="e"
+        )
+        create_card_label(self.stats_frame, textvariable=self.eff_str_var, bg=stats_bg).grid(
+            row=2, column=4, sticky="w"
+        )
 
         ensure_goal_progress_style()
-        progress_box = tk.LabelFrame(self.parent, text="轮次进度")
-        progress_box.pack(fill="x", padx=10, pady=5)
+        progress_card, progress_box = create_card(self.parent, "轮次进度")
+        progress_card.pack(fill="x", padx=10, pady=5)
         ttk.Progressbar(
             progress_box,
             variable=self.wave_progress_var,
             maximum=100.0,
             style="Goal.Horizontal.TProgressbar",
         ).pack(fill="x", padx=10, pady=5)
-        tk.Label(progress_box, textvariable=self.wave_progress_label_var, anchor="e").pack(fill="x", padx=10, pady=(0, 5))
+        create_card_label(
+            progress_box, textvariable=self.wave_progress_label_var, anchor="e"
+        ).pack(fill="x", padx=10, pady=(0, 5))
 
-        ctrl = tk.Frame(self.parent)
-        ctrl.pack(fill="x", padx=10, pady=5)
+        ctrl_card, ctrl = create_card(self.parent, "刷取控制")
+        ctrl_card.pack(fill="x", padx=10, pady=5)
         self.start_btn = ttk.Button(
-            ctrl, text=f"开始刷{self.product_short_label}", command=lambda: self.start_farming()
+            ctrl,
+            text=f"开始刷{self.product_short_label}",
+            command=lambda: self.start_farming(),
+            style="Accent.TButton",
         )
         self.start_btn.pack(side="left", padx=3)
-        self.stop_btn = ttk.Button(ctrl, text="停止", command=lambda: self.stop_farming())
+        self.stop_btn = ttk.Button(
+            ctrl, text="停止", command=lambda: self.stop_farming(), style="Card.TButton"
+        )
         self.stop_btn.pack(side="left", padx=3)
 
-        self.log_frame = tk.LabelFrame(self.parent, text=f"{self.product_label}日志")
-        self.log_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        self.log_text = tk.Text(self.log_frame, height=10)
+        log_card, self.log_frame = create_card(
+            self.parent, title=f"{self.product_label}日志"
+        )
+        log_card.pack(fill="both", expand=True, padx=10, pady=5)
+        self.log_text = tk.Text(self.log_frame, height=10, bg="#f9f9ff", relief="flat")
         self.log_text.pack(side="left", fill="both", expand=True)
         sb = tk.Scrollbar(self.log_frame, command=self.log_text.yview)
         sb.pack(side="right", fill="y")
@@ -1555,14 +1749,16 @@ class FragmentFarmGUI:
             f"2. 若需要展示{self.product_label}预览，可在 {self.preview_dir_hint}/ 目录放入与{self.letter_label}同名的 1.png / 2.png 等图片。\n"
             f"3. 按钮图（继续挑战/确认选择/撤退/mapa/mapb/G/Q/exit_step1）放在 {self.templates_dir_hint}/ 目录。\n"
         )
-        self.tip_label = tk.Label(
-            self.parent,
+        tip_card, tip_inner = create_card(self.parent, "使用提示")
+        tip_card.pack(fill="x", padx=10, pady=(0, 8))
+        self.tip_label = create_card_label(
+            tip_inner,
             text=tip_text,
             fg="#666666",
             anchor="w",
             justify="left",
         )
-        self.tip_label.pack(fill="x", padx=10, pady=(0, 8))
+        self.tip_label.pack(fill="x")
 
     # ---- 日志 ----
     def log(self, msg: str):
@@ -1747,17 +1943,22 @@ class FragmentFarmGUI:
         if (
             not self.enable_no_trick_decrypt
             or self.no_trick_status_frame is None
+            or self.no_trick_status_card is None
             or self.no_trick_var is None
         ):
             return
-        if not self.no_trick_status_frame.winfo_ismapped():
-            self.no_trick_status_frame.pack(fill="x", padx=10, pady=5)
+        if not self.no_trick_status_card.winfo_ismapped():
+            self.no_trick_status_card.pack(fill="x", padx=10, pady=5)
 
     def _hide_no_trick_frame(self):
-        if not self.enable_no_trick_decrypt or self.no_trick_status_frame is None:
+        if (
+            not self.enable_no_trick_decrypt
+            or self.no_trick_status_frame is None
+            or self.no_trick_status_card is None
+        ):
             return
-        if self.no_trick_status_frame.winfo_manager():
-            self.no_trick_status_frame.pack_forget()
+        if self.no_trick_status_card.winfo_manager():
+            self.no_trick_status_card.pack_forget()
 
     def _set_no_trick_status_direct(self, text: str):
         if self.no_trick_status_var is not None:
@@ -2679,104 +2880,136 @@ class ExpelFragmentGUI:
         self._bind_hotkey()
 
     def _build_ui(self):
-        tip_top = tk.Label(
-            self.parent,
+        ensure_modern_style()
+
+        banner_card, banner_inner = create_card(self.parent, "模式说明")
+        banner_card.pack(fill="x", padx=10, pady=5)
+        create_card_label(
+            banner_inner,
             text=(
                 f"驱离模式：选择{self.letter_label}后自动等待 7 秒进入地图 → W 键前进 10 秒 → 随机 WASD + 每 5 秒按一次 E。"
             ),
-            fg="red",
+            fg=CARD_NOTICE_FG,
             font=("Microsoft YaHei", 10, "bold"),
-        )
-        tip_top.pack(fill="x", padx=10, pady=3)
+        ).pack(fill="x")
 
-        top = tk.Frame(self.parent)
-        top.pack(fill="x", padx=10, pady=5)
-
-        tk.Label(top, text="总波数:").grid(row=0, column=0, sticky="e")
+        settings_card, top = create_card(self.parent, "基础设置")
+        settings_card.pack(fill="x", padx=10, pady=5)
+        top_bg = top.cget("bg")
+        create_card_label(top, text="总波数:", bg=top_bg).grid(row=0, column=0, sticky="e")
         tk.Entry(top, textvariable=self.wave_var, width=6).grid(row=0, column=1, sticky="w", padx=3)
-        tk.Label(top, text="（默认 10 波）").grid(row=0, column=2, sticky="w")
+        create_card_label(top, text="（默认 10 波）", bg=top_bg).grid(row=0, column=2, sticky="w")
 
-        tk.Label(top, text="局内超时(秒):").grid(row=0, column=3, sticky="e")
+        create_card_label(top, text="局内超时(秒):", bg=top_bg).grid(row=0, column=3, sticky="e")
         tk.Entry(top, textvariable=self.timeout_var, width=6).grid(row=0, column=4, sticky="w", padx=3)
-        tk.Label(top, text="（防卡死判定）").grid(row=0, column=5, sticky="w")
+        create_card_label(top, text="（防卡死判定）", bg=top_bg).grid(row=0, column=5, sticky="w")
 
-        tk.Checkbutton(
-            top,
-            text="开启循环",
-            variable=self.auto_loop_var,
-        ).grid(row=0, column=6, sticky="w", padx=10)
+        create_card_checkbutton(top, text="开启循环", variable=self.auto_loop_var).grid(
+            row=0, column=6, sticky="w", padx=10
+        )
 
-        hotkey_frame = tk.Frame(self.parent)
-        hotkey_frame.pack(fill="x", padx=10, pady=5)
-        self.hotkey_label_widget = tk.Label(
-            hotkey_frame, text=f"刷{self.product_short_label}热键:"
+        hotkey_card, hotkey_frame = create_card(self.parent, "热键设置")
+        hotkey_card.pack(fill="x", padx=10, pady=5)
+        hotkey_bg = hotkey_frame.cget("bg")
+        self.hotkey_label_widget = create_card_label(
+            hotkey_frame, text=f"刷{self.product_short_label}热键:", bg=hotkey_bg
         )
         self.hotkey_label_widget.pack(side="left")
         tk.Entry(hotkey_frame, textvariable=self.hotkey_var, width=20).pack(side="left", padx=5)
-        ttk.Button(hotkey_frame, text="录制热键", command=self._capture_hotkey).pack(side="left", padx=3)
-        ttk.Button(hotkey_frame, text="保存设置", command=self._save_settings).pack(side="left", padx=3)
+        ttk.Button(
+            hotkey_frame, text="录制热键", command=self._capture_hotkey, style="Card.TButton"
+        ).pack(side="left", padx=3)
+        ttk.Button(
+            hotkey_frame, text="保存设置", command=self._save_settings, style="Card.TButton"
+        ).pack(side="left", padx=3)
 
-        self.frame_letters = tk.LabelFrame(
+        letters_card, letters_inner = create_card(
             self.parent,
-            text=f"{self.letter_label}选择（来自 {self.letters_dir_hint}/）",
+            title=f"{self.letter_label}选择（来自 {self.letters_dir_hint}/）",
         )
-        self.frame_letters.pack(fill="both", expand=True, padx=10, pady=5)
+        letters_card.pack(fill="both", expand=True, padx=10, pady=5)
+        self.frame_letters = letters_inner
+        letters_bg = self.frame_letters.cget("bg")
 
-        self.letters_grid = tk.Frame(self.frame_letters)
+        self.letters_grid = tk.Frame(self.frame_letters, bg=letters_bg)
         self.letters_grid.pack(fill="both", expand=True, padx=5, pady=5)
 
         self.selected_label_var = tk.StringVar(value=f"当前未选择{self.letter_label}")
-        self.selected_label_widget = tk.Label(
-            self.frame_letters, textvariable=self.selected_label_var, fg="#0080ff"
+        self.selected_label_widget = create_card_label(
+            self.frame_letters,
+            textvariable=self.selected_label_var,
+            fg="#0080ff",
+            bg=letters_bg,
         )
         self.selected_label_widget.pack(anchor="w", padx=5, pady=3)
 
-        self.stats_frame = tk.LabelFrame(
-            self.parent, text=f"{self.product_label}统计（实时）"
+        stats_card, self.stats_frame = create_card(
+            self.parent, title=f"{self.product_label}统计（实时）"
         )
-        self.stats_frame.pack(fill="x", padx=10, pady=5)
+        stats_card.pack(fill="x", padx=10, pady=5)
+        stats_bg = self.stats_frame.cget("bg")
 
-        self.stat_image_label = tk.Label(self.stats_frame, relief="sunken")
+        self.stat_image_label = tk.Label(self.stats_frame, relief="sunken", bg=stats_bg)
         self.stat_image_label.grid(row=0, column=0, rowspan=3, padx=5, pady=5)
 
-        self.current_entity_label = tk.Label(
-            self.stats_frame, text=f"当前{self.entity_label}："
+        self.current_entity_label = create_card_label(
+            self.stats_frame, text=f"当前{self.entity_label}：", bg=stats_bg
         )
         self.current_entity_label.grid(row=0, column=1, sticky="e")
-        tk.Label(self.stats_frame, textvariable=self.stat_name_var).grid(row=0, column=2, sticky="w")
+        create_card_label(self.stats_frame, textvariable=self.stat_name_var, bg=stats_bg).grid(
+            row=0, column=2, sticky="w"
+        )
 
-        self.total_product_label = tk.Label(
-            self.stats_frame, text=f"累计{self.product_label}："
+        self.total_product_label = create_card_label(
+            self.stats_frame, text=f"累计{self.product_label}：", bg=stats_bg
         )
         self.total_product_label.grid(row=1, column=1, sticky="e")
-        tk.Label(
+        create_card_label(
             self.stats_frame,
             textvariable=self.fragment_count_var,
             font=("Microsoft YaHei", 12, "bold"),
             fg="#ff6600",
+            bg=stats_bg,
         ).grid(row=1, column=2, sticky="w")
 
-        tk.Label(self.stats_frame, text="运行时间：").grid(row=0, column=3, sticky="e")
-        tk.Label(self.stats_frame, textvariable=self.time_str_var).grid(row=0, column=4, sticky="w")
+        create_card_label(self.stats_frame, text="运行时间：", bg=stats_bg).grid(
+            row=0, column=3, sticky="e"
+        )
+        create_card_label(self.stats_frame, textvariable=self.time_str_var, bg=stats_bg).grid(
+            row=0, column=4, sticky="w"
+        )
 
-        tk.Label(self.stats_frame, text="平均掉落：").grid(row=1, column=3, sticky="e")
-        tk.Label(self.stats_frame, textvariable=self.rate_str_var).grid(row=1, column=4, sticky="w")
+        create_card_label(self.stats_frame, text="平均掉落：", bg=stats_bg).grid(
+            row=1, column=3, sticky="e"
+        )
+        create_card_label(self.stats_frame, textvariable=self.rate_str_var, bg=stats_bg).grid(
+            row=1, column=4, sticky="w"
+        )
 
-        tk.Label(self.stats_frame, text="效率：").grid(row=2, column=3, sticky="e")
-        tk.Label(self.stats_frame, textvariable=self.eff_str_var).grid(row=2, column=4, sticky="w")
+        create_card_label(self.stats_frame, text="效率：", bg=stats_bg).grid(
+            row=2, column=3, sticky="e"
+        )
+        create_card_label(self.stats_frame, textvariable=self.eff_str_var, bg=stats_bg).grid(
+            row=2, column=4, sticky="w"
+        )
 
-        ctrl = tk.Frame(self.parent)
-        ctrl.pack(fill="x", padx=10, pady=5)
+        ctrl_card, ctrl = create_card(self.parent, "刷取控制")
+        ctrl_card.pack(fill="x", padx=10, pady=5)
         self.start_btn = ttk.Button(
-            ctrl, text=f"开始刷{self.product_short_label}", command=lambda: self.start_farming()
+            ctrl,
+            text=f"开始刷{self.product_short_label}",
+            command=lambda: self.start_farming(),
+            style="Accent.TButton",
         )
         self.start_btn.pack(side="left", padx=3)
-        self.stop_btn = ttk.Button(ctrl, text="停止", command=lambda: self.stop_farming())
+        self.stop_btn = ttk.Button(
+            ctrl, text="停止", command=lambda: self.stop_farming(), style="Card.TButton"
+        )
         self.stop_btn.pack(side="left", padx=3)
 
-        self.log_frame = tk.LabelFrame(self.parent, text="驱离模式日志")
-        self.log_frame.pack(fill="both", expand=True, padx=10, pady=5)
-        self.log_text = tk.Text(self.log_frame, height=10)
+        log_card, self.log_frame = create_card(self.parent, "驱离模式日志")
+        log_card.pack(fill="both", expand=True, padx=10, pady=5)
+        self.log_text = tk.Text(self.log_frame, height=10, bg="#f9f9ff", relief="flat")
         self.log_text.pack(side="left", fill="both", expand=True)
         sb = tk.Scrollbar(self.log_frame, command=self.log_text.yview)
         sb.pack(side="right", fill="y")
@@ -2788,14 +3021,16 @@ class ExpelFragmentGUI:
             f"2. {self.letter_label}图片放入 {self.letters_dir_hint}/ 目录，常用按钮模板仍存放在 {self.templates_dir_hint}/ 目录。\n"
             "3. 若卡死会自动执行 Esc→G→Q→exit_step1 的防卡死流程，并重新开始当前波。\n"
         )
-        self.tip_label = tk.Label(
-            self.parent,
+        tip_card, tip_inner = create_card(self.parent, "使用提示")
+        tip_card.pack(fill="x", padx=10, pady=(0, 8))
+        self.tip_label = create_card_label(
+            tip_inner,
             text=tip_text,
             fg="#666666",
             anchor="w",
             justify="left",
         )
-        self.tip_label.pack(fill="x", padx=10, pady=(0, 8))
+        self.tip_label.pack(fill="x")
 
     def log(self, msg: str):
         ts = time.strftime("[%H:%M:%S] ")
