@@ -691,6 +691,132 @@ def load_actions(path: str):
     return acts
 
 
+MOUSE_ACTION_TYPES = {
+    "mouse_move",
+    "mouse_move_relative",
+    "mouse_click",
+    "mouse_down",
+    "mouse_up",
+    "mouse_scroll",
+    "mouse_rotation",
+    "mouse_drag",
+    "mouse_drag_relative",
+}
+
+
+def _execute_mouse_action(action: dict, label: str) -> bool:
+    if pyautogui is None:
+        return False
+
+    ttype = action.get("type")
+    try:
+        duration = float(action.get("duration", 0.0) or 0.0)
+    except Exception:
+        duration = 0.0
+
+    if ttype == "mouse_move":
+        try:
+            x = float(action.get("x"))
+            y = float(action.get("y"))
+        except (TypeError, ValueError):
+            log(f"{label}：鼠标移动动作缺少坐标，已跳过。")
+            return False
+        pyautogui.moveTo(int(round(x)), int(round(y)), duration=max(0.0, duration))
+        return True
+
+    if ttype == "mouse_move_relative":
+        try:
+            dx = float(action.get("dx", action.get("x")))
+            dy = float(action.get("dy", action.get("y")))
+        except (TypeError, ValueError):
+            log(f"{label}：相对鼠标移动动作缺少位移，已跳过。")
+            return False
+        pyautogui.moveRel(int(round(dx)), int(round(dy)), duration=max(0.0, duration))
+        return True
+
+    if ttype == "mouse_click":
+        button = action.get("button", "left") or "left"
+        clicks = action.get("clicks", 1)
+        interval = action.get("interval", 0)
+        try:
+            clicks = int(clicks)
+        except (TypeError, ValueError):
+            clicks = 1
+        try:
+            interval = float(interval)
+        except (TypeError, ValueError):
+            interval = 0.0
+        pyautogui.click(clicks=max(1, clicks), interval=max(0.0, interval), button=button)
+        return True
+
+    if ttype == "mouse_down":
+        button = action.get("button", "left") or "left"
+        pyautogui.mouseDown(button=button)
+        return True
+
+    if ttype == "mouse_up":
+        button = action.get("button", "left") or "left"
+        pyautogui.mouseUp(button=button)
+        return True
+
+    if ttype == "mouse_scroll":
+        amount = action.get("amount", action.get("clicks"))
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            log(f"{label}：鼠标滚轮动作缺少数量，已跳过。")
+            return False
+        x = action.get("x")
+        y = action.get("y")
+        try:
+            x = None if x is None else int(round(float(x)))
+            y = None if y is None else int(round(float(y)))
+        except (TypeError, ValueError):
+            x = None
+            y = None
+        pyautogui.scroll(amount, x=x, y=y)
+        return True
+
+    if ttype in {"mouse_drag", "mouse_drag_relative"}:
+        try:
+            dx = float(action.get("dx", action.get("x")))
+            dy = float(action.get("dy", action.get("y")))
+        except (TypeError, ValueError):
+            log(f"{label}：鼠标拖拽动作缺少位移，已跳过。")
+            return False
+        button = action.get("button", "left") or "left"
+        pyautogui.dragRel(int(round(dx)), int(round(dy)), duration=max(0.0, duration), button=button)
+        return True
+
+    if ttype == "mouse_rotation":
+        direction = str(action.get("direction", "")).lower()
+        try:
+            angle = float(action.get("angle", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            angle = 0.0
+        try:
+            sensitivity = float(action.get("sensitivity", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            sensitivity = 1.0
+        magnitude = angle * sensitivity
+        dx = dy = 0.0
+        if direction in ("left", "right"):
+            dx = magnitude if direction == "right" else -magnitude
+        elif direction in ("up", "down"):
+            dy = -magnitude if direction == "up" else magnitude
+        else:
+            log(f"{label}：鼠标旋转方向未知（{direction}），已跳过。")
+            return False
+        dx_i = int(round(dx))
+        dy_i = int(round(dy))
+        if dx_i == 0 and dy_i == 0:
+            return True
+        pyautogui.moveRel(dx_i, dy_i, duration=max(0.0, duration))
+        return True
+
+    return False
+
+
 def play_macro(
     path: str,
     label: str,
@@ -706,12 +832,19 @@ def play_macro(
     - time.perf_counter + 自旋保证时间精度
     - interrupt_on_exit=True 时，会周期性检测退图界面，发现就提前结束宏
     """
-    if keyboard is None:
-        log("未安装 keyboard 模块，无法回放宏。")
-        return
-
     actions = load_actions(path)
     if not actions:
+        return
+
+    requires_keyboard = any(act.get("type") in {"key_down", "key_up"} for act in actions)
+    requires_mouse = any(act.get("type") in MOUSE_ACTION_TYPES for act in actions)
+
+    if requires_keyboard and keyboard is None:
+        log("未安装 keyboard 模块，无法回放包含按键的宏。")
+        return
+
+    if requires_mouse and pyautogui is None:
+        log("未安装 pyautogui 模块，无法回放包含鼠标动作的宏。")
         return
 
     if not label:
@@ -724,6 +857,7 @@ def play_macro(
     start_time = time.perf_counter()
     executed_count = 0
     keyboard_count = 0
+    mouse_count = 0
     last_progress_percent = 0
 
     try:
@@ -770,19 +904,37 @@ def play_macro(
                     if time.perf_counter() - start_time >= target_time:
                         break
 
+            executed = False
             try:
                 ttype = action.get("type", "key_down")
                 key = action.get("key")
-                if ttype == "key_down" and key:
+                if ttype == "key_down" and key and keyboard is not None:
                     keyboard.press(key)
                     keyboard_count += 1
-                    executed_count += 1
-                elif ttype == "key_up" and key:
+                    executed = True
+                elif ttype == "key_up" and key and keyboard is not None:
                     keyboard.release(key)
-                    executed_count += 1
+                    executed = True
+                elif ttype in MOUSE_ACTION_TYPES:
+                    executed = _execute_mouse_action(action, label)
+                    if executed:
+                        mouse_count += 1
+                elif ttype == "sleep":
+                    try:
+                        delay = float(action.get("duration", action.get("time", 0.0)))
+                    except (TypeError, ValueError):
+                        delay = 0.0
+                    if delay > 0:
+                        time.sleep(delay)
+                    executed = True
+                else:
+                    log(f"{label}：未知动作类型 {ttype}，已跳过。")
             except Exception as e:
                 log(f"{label}：动作 {i} 发送失败：{e}")
                 continue
+
+            if executed:
+                executed_count += 1
 
             local_progress = (i + 1) / total_actions
             global_p = p1 + local_progress * (p2 - p1)
@@ -795,7 +947,10 @@ def play_macro(
 
             percent = int(local_progress * 100)
             if percent - last_progress_percent >= 10:
-                log(f"{label} 回放进度：{percent}%（键盘:{keyboard_count}）")
+                stats = [f"键盘:{keyboard_count}"]
+                if mouse_count:
+                    stats.append(f"鼠标:{mouse_count}")
+                log(f"{label} 回放进度：{percent}%（{'，'.join(stats)}）")
                 last_progress_percent = percent
 
         actual_elapsed = time.perf_counter() - start_time
@@ -806,7 +961,10 @@ def play_macro(
         log(f"  实际耗时：{actual_elapsed:.3f} 秒")
         log(f"  时间偏差：{time_diff * 1000:.1f} 毫秒")
         log(f"  时间轴还原精度：{accuracy:.2f}%")
-        log(f"  执行动作：{executed_count}/{total_actions}（键盘:{keyboard_count}）")
+        stats = [f"键盘:{keyboard_count}"]
+        if mouse_count:
+            stats.append(f"鼠标:{mouse_count}")
+        log(f"  执行动作：{executed_count}/{total_actions}（{'，'.join(stats)}）")
 
     finally:
         if interrupter is not None:
@@ -819,7 +977,7 @@ def play_macro(
                 pressed.add(act.get("key"))
             elif act.get("type") == "key_up":
                 pressed.discard(act.get("key"))
-        if pressed:
+        if pressed and keyboard is not None:
             log(f"{label}：释放未松开的按键：{', '.join(k for k in pressed if k)}")
             for k in pressed:
                 try:
