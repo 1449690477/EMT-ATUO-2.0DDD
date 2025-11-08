@@ -1026,6 +1026,290 @@ class FireworkNoTrickController:
         self.last_detect_time = 0.0
         self.last_wait_notify = 0.0
         self.session_started = False
+        self.session_completed = False
+        self.trigger_count = 0
+        self.executed_macros = 0
+        self.macro_missing = False
+        self.active = False
+        self.thread = None
+
+    def start(self) -> bool:
+        if cv2 is None or np is None:
+            log("缺少 opencv/numpy，无法开启无巧手解密监控。")
+            try:
+                self.gui.on_no_trick_unavailable("缺少 opencv/numpy")
+            except Exception:
+                pass
+            return False
+        self.templates = self._load_templates()
+        if not self.templates:
+            try:
+                self.gui.on_no_trick_no_templates(self.game_dir)
+            except Exception:
+                pass
+            return False
+        self.stop_event.clear()
+        self.pending.clear()
+        self.pending_names.clear()
+        self.recent_hits.clear()
+        self.last_detect_time = 0.0
+        self.last_wait_notify = 0.0
+        self.trigger_count = 0
+        self.executed_macros = 0
+        self.macro_missing = False
+        self.active = False
+        self.session_completed = False
+        self.session_started = True
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread.start()
+        try:
+            self.gui.on_no_trick_monitor_started(self.templates)
+        except Exception:
+            pass
+        return True
+
+    def stop(self):
+        self.stop_event.set()
+        self.session_started = False
+
+    def finish_session(self):
+        if self.thread and self.thread.is_alive():
+            self.stop_event.set()
+            try:
+                self.thread.join(timeout=0.5)
+            except Exception:
+                pass
+        self.session_started = False
+        try:
+            self.gui.on_no_trick_session_finished(
+                triggered=self.trigger_count > 0,
+                macro_executed=self.executed_macros > 0,
+                macro_missing=self.macro_missing,
+            )
+        except Exception:
+            pass
+
+    def run_decrypt_if_needed(self) -> float:
+        if worker_stop.is_set() or not self.session_started:
+            return 0.0
+
+        task = None
+        with self.lock:
+            if self.pending:
+                task = self.pending.popleft()
+                entry = task[0]
+                if entry:
+                    self.pending_names.discard(entry.get("name"))
+            active = self.active
+            last_time = self.last_detect_time
+
+        if task is not None:
+            entry, score = task
+            return self._execute_entry(entry, score)
+
+        if active:
+            now = time.time()
+            elapsed = now - last_time if last_time else 0.0
+            remaining = self.COMPLETE_TIMEOUT - elapsed
+            if remaining > 0:
+                if now - self.last_wait_notify >= 0.3:
+                    self.last_wait_notify = now
+                    if hasattr(self.gui, "on_no_trick_idle"):
+                        try:
+                            self.gui.on_no_trick_idle(max(0.0, remaining))
+                        except Exception:
+                            pass
+                sleep_time = min(self.CHECK_INTERVAL, max(0.05, remaining))
+                time.sleep(sleep_time)
+                return sleep_time
+            with self.lock:
+                self.active = False
+            if hasattr(self.gui, "on_no_trick_idle_complete"):
+                try:
+                    self.gui.on_no_trick_idle_complete()
+                except Exception:
+                    pass
+        return 0.0
+
+    def _execute_entry(self, entry, score: float) -> float:
+        if entry is None:
+            return 0.0
+        name = entry.get("name", "")
+        base_name = entry.get("base_name") or os.path.splitext(name)[0]
+        macro_path = entry.get("json_path")
+        with self.lock:
+            self.active = True
+            self.last_detect_time = time.time()
+            self.last_wait_notify = 0.0
+        if not macro_path or not os.path.exists(macro_path):
+            self.macro_missing = True
+            try:
+                self.gui.on_no_trick_macro_missing(entry)
+            except Exception:
+                pass
+            return 0.0
+
+        macro_label = f"赛琪无巧手解密 {base_name}.json"
+        log(f"赛琪无巧手解密：回放 {base_name}.json 宏。")
+
+        try:
+            self.gui.on_no_trick_macro_start(entry, score)
+        except Exception:
+            pass
+
+        start = time.perf_counter()
+
+        def progress_cb(p):
+            try:
+                self.gui.on_no_trick_progress(p)
+            except Exception:
+                pass
+
+        try:
+            play_macro(
+                macro_path,
+                macro_label,
+                0.0,
+                0.0,
+                interrupt_on_exit=False,
+                progress_callback=progress_cb,
+            )
+        finally:
+            with self.lock:
+                self.last_detect_time = time.time()
+
+        self.executed_macros += 1
+
+        try:
+            self.gui.on_no_trick_macro_complete(entry)
+        except Exception:
+            pass
+
+        self._mark_session_completed()
+
+        end = time.perf_counter()
+        return max(0.0, end - start)
+
+    def _monitor_loop(self):
+        while not self.stop_event.is_set() and not worker_stop.is_set():
+            try:
+                img = screenshot_game()
+            except Exception as e:
+                log(f"赛琪无巧手解密：截图失败 {e}")
+                time.sleep(self.CHECK_INTERVAL)
+                continue
+
+            try:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            except Exception as e:
+                log(f"赛琪无巧手解密：转灰度失败 {e}")
+                time.sleep(self.CHECK_INTERVAL)
+                continue
+
+            detected = False
+            for entry in self.templates:
+                tpl = entry.get("template")
+                if tpl is None:
+                    continue
+                try:
+                    res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, _ = cv2.minMaxLoc(res)
+                except Exception as e:
+                    log(f"赛琪无巧手解密：匹配 {entry.get('name')} 失败：{e}")
+                    continue
+                if max_val >= self.MATCH_THRESHOLD:
+                    self._queue_detection(entry, max_val)
+                    detected = True
+            if not detected:
+                time.sleep(self.CHECK_INTERVAL)
+
+    def _queue_detection(self, entry, score: float):
+        now = time.time()
+        name = entry.get("name")
+        with self.lock:
+            if self.session_completed:
+                return
+            last_hit = self.recent_hits.get(name, 0.0)
+            if name in self.pending_names and now - last_hit < self.DUPLICATE_COOLDOWN:
+                return
+            if now - last_hit < self.DUPLICATE_COOLDOWN:
+                return
+            self.pending.append((entry, score))
+            if name is not None:
+                self.pending_names.add(name)
+                self.recent_hits[name] = now
+            self.last_detect_time = now
+            self.active = True
+            self.last_wait_notify = 0.0
+        self.trigger_count += 1
+        try:
+            self.gui.on_no_trick_detected(entry, score)
+        except Exception:
+            pass
+
+    def _load_templates(self):
+        templates = []
+        if not os.path.isdir(self.game_dir):w
+            return templates
+        try:
+            candidates = [
+                f
+                for f in os.listdir(self.game_dir)
+                if f.lower().endswith(".png")
+            ]
+        except Exception as e:
+            log(f"读取 {self.game_dir} 目录失败：{e}")
+            return templates
+W         
+        for name in sorted(candidates):
+            base_name = os.path.splitext(name)[0]
+            png_path = os.path.join(self.game_dir, name)
+            json_path = os.path.join(self.game_dir, base_name + ".json")
+            try:
+                data = np.fromfile(png_path, dtype=np.uint8)
+                tpl = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
+            except Exception as e:
+                log(f"赛琪无巧手解密：读取模板 {png_path} 失败：{e}")
+                tpl = None
+            templates.append(
+                {
+                    "name": name,
+                    "png_path": png_path,
+                    "json_path": json_path,
+                    "base_name": base_name,
+                    "template": tpl,
+                }
+            )
+        return templates
+
+    def _mark_session_completed(self):
+        self.session_completed = True
+        self.session_started = False
+        self.stop_event.set()
+        with self.lock:
+            self.pending.clear()
+            self.pending_names.clear()
+            self.active = False
+            self.last_wait_notify = 0.0
+
+class FireworkNoTrickController:
+    MATCH_THRESHOLD = 0.7
+    CHECK_INTERVAL = 0.4
+    COMPLETE_TIMEOUT = 3.0
+    DUPLICATE_COOLDOWN = 1.0
+
+    def __init__(self, gui, game_dir: str):
+        self.gui = gui
+        self.game_dir = game_dir
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.templates = []
+        self.pending = deque()
+        self.pending_names = set()
+        self.recent_hits = {}
+        self.last_detect_time = 0.0
+        self.last_wait_notify = 0.0
+        self.session_started = False
         self.trigger_count = 0
         self.executed_macros = 0
         self.macro_missing = False
