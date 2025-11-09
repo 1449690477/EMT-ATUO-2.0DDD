@@ -704,6 +704,88 @@ MOUSE_ACTION_TYPES = {
 }
 
 
+class KeyboardPlaybackState:
+    """Track pressed keys during macro playback.
+
+    The state helps us temporarily release modifiers before running nested
+    decrypt macros so they don't combine with replayed keys to trigger system
+    shortcuts (例如 Win+数字 打开计算器)。
+    """
+
+    def __init__(self):
+        self._active = []
+
+    def press(self, key: str) -> bool:
+        if keyboard is None or not key:
+            return False
+        try:
+            keyboard.press(key)
+            self._active.append(key)
+            return True
+        except Exception:
+            return False
+
+    def release(self, key: str) -> bool:
+        if keyboard is None or not key:
+            return False
+        try:
+            keyboard.release(key)
+        except Exception:
+            return False
+        for idx in range(len(self._active) - 1, -1, -1):
+            if self._active[idx] == key:
+                del self._active[idx]
+                break
+        return True
+
+    def suspend(self):
+        """Release all currently pressed keys and return them for restoration."""
+
+        if not self._active or keyboard is None:
+            keys = list(self._active)
+            self._active.clear()
+            return keys
+
+        keys = list(self._active)
+        for key in reversed(keys):
+            if not key:
+                continue
+            try:
+                keyboard.release(key)
+            except Exception:
+                pass
+        self._active.clear()
+        return keys
+
+    def resume(self, keys):
+        if keyboard is None or not keys:
+            return
+        for key in keys:
+            if not key:
+                continue
+            try:
+                keyboard.press(key)
+                self._active.append(key)
+            except Exception:
+                pass
+
+    def release_all(self):
+        if not self._active or keyboard is None:
+            self._active.clear()
+            return
+        for key in reversed(self._active):
+            if not key:
+                continue
+            try:
+                keyboard.release(key)
+            except Exception:
+                pass
+        self._active.clear()
+
+    def active_keys(self):
+        return list(self._active)
+
+
 def macro_has_segments(path: str) -> bool:
     """Return True when the JSON macro contains segment playback data."""
 
@@ -1040,6 +1122,7 @@ def play_macro(
     keyboard_count = 0
     mouse_count = 0
     last_progress_percent = 0
+    keyboard_state = KeyboardPlaybackState() if requires_keyboard else None
 
     try:
         for i, action in enumerate(actions):
@@ -1052,7 +1135,7 @@ def play_macro(
                 break
 
             if interrupter is not None:
-                pause_time = interrupter.run_decrypt_if_needed()
+                pause_time = interrupter.run_decrypt_if_needed(keyboard_state)
                 if pause_time:
                     start_time += pause_time
 
@@ -1074,11 +1157,11 @@ def play_macro(
                     chunk = min(0.05, max(sleep_time - 0.0005, 0.0))
                     if chunk > 0:
                         time.sleep(chunk)
-                    pause_time = interrupter.run_decrypt_if_needed()
+                    pause_time = interrupter.run_decrypt_if_needed(keyboard_state)
                     if pause_time:
                         start_time += pause_time
                 while True:
-                    pause_time = interrupter.run_decrypt_if_needed()
+                    pause_time = interrupter.run_decrypt_if_needed(keyboard_state)
                     if pause_time:
                         start_time += pause_time
                         continue
@@ -1090,12 +1173,26 @@ def play_macro(
                 ttype = action.get("type", "key_down")
                 key = action.get("key")
                 if ttype == "key_down" and key and keyboard is not None:
-                    keyboard.press(key)
-                    keyboard_count += 1
-                    executed = True
+                    if keyboard_state is not None:
+                        if keyboard_state.press(key):
+                            keyboard_count += 1
+                            executed = True
+                    else:
+                        try:
+                            keyboard.press(key)
+                            keyboard_count += 1
+                            executed = True
+                        except Exception:
+                            pass
                 elif ttype == "key_up" and key and keyboard is not None:
-                    keyboard.release(key)
-                    executed = True
+                    if keyboard_state is not None:
+                        executed = keyboard_state.release(key)
+                    else:
+                        try:
+                            keyboard.release(key)
+                            executed = True
+                        except Exception:
+                            pass
                 elif ttype in MOUSE_ACTION_TYPES:
                     executed = _execute_mouse_action(action, label)
                     if executed:
@@ -1149,23 +1246,14 @@ def play_macro(
 
     finally:
         if interrupter is not None:
-            pause_time = interrupter.run_decrypt_if_needed()
+            pause_time = interrupter.run_decrypt_if_needed(keyboard_state)
             if pause_time:
                 start_time += pause_time
-        pressed = set()
-        for act in actions:
-            if act.get("type") == "key_down":
-                pressed.add(act.get("key"))
-            elif act.get("type") == "key_up":
-                pressed.discard(act.get("key"))
-        if pressed and keyboard is not None:
-            log(f"{label}：释放未松开的按键：{', '.join(k for k in pressed if k)}")
-            for k in pressed:
-                try:
-                    if k:
-                        keyboard.release(k)
-                except Exception:
-                    pass
+        if keyboard_state is not None:
+            active = keyboard_state.active_keys()
+            if active:
+                log(f"{label}：释放未松开的按键：{', '.join(k for k in active if k)}")
+            keyboard_state.release_all()
 
     return executed_count > 0
 
@@ -1230,7 +1318,7 @@ class NoTrickDecryptController:
             macro_missing=self.macro_missing,
         )
 
-    def run_decrypt_if_needed(self) -> float:
+    def run_decrypt_if_needed(self, keyboard_state=None) -> float:
         if worker_stop.is_set():
             return 0.0
         with self.trigger_lock:
@@ -1252,6 +1340,10 @@ class NoTrickDecryptController:
             self.gui.on_no_trick_macro_missing(entry)
             return 0.0
 
+        restore_keys = None
+        if keyboard_state is not None:
+            restore_keys = keyboard_state.suspend()
+
         base_name = entry.get("base_name") or os.path.splitext(entry.get("name", ""))[0]
         macro_label = f"{self.gui.log_prefix} 无巧手解密 {base_name}.json"
         log(f"{self.gui.log_prefix} 无巧手解密：回放 {base_name}.json 宏。")
@@ -1265,31 +1357,35 @@ class NoTrickDecryptController:
         executed = False
         use_segment_macro = bool(entry.get("has_segments"))
 
-        if use_segment_macro:
-            played = play_segment_macro(
-                macro_path,
-                macro_label,
-                progress_callback=progress_cb,
-            )
-            if played:
-                executed = True
-            else:
-                use_segment_macro = False
-                if progress_callback is not None:
-                    try:
-                        progress_callback(0.0)
-                    except Exception:
-                        pass
+        try:
+            if use_segment_macro:
+                played = play_segment_macro(
+                    macro_path,
+                    macro_label,
+                    progress_callback=progress_cb,
+                )
+                if played:
+                    executed = True
+                else:
+                    use_segment_macro = False
+                    if progress_callback is not None:
+                        try:
+                            progress_callback(0.0)
+                        except Exception:
+                            pass
 
-        if not use_segment_macro:
-            executed = play_macro(
-                macro_path,
-                macro_label,
-                0.0,
-                0.0,
-                interrupt_on_exit=False,
-                progress_callback=progress_cb,
-            )
+            if not use_segment_macro:
+                executed = play_macro(
+                    macro_path,
+                    macro_label,
+                    0.0,
+                    0.0,
+                    interrupt_on_exit=False,
+                    progress_callback=progress_cb,
+                )
+        finally:
+            if keyboard_state is not None:
+                keyboard_state.resume(restore_keys)
 
         end = time.perf_counter()
 
@@ -1456,7 +1552,7 @@ class FireworkNoTrickController:
         except Exception:
             pass
 
-    def run_decrypt_if_needed(self) -> float:
+    def run_decrypt_if_needed(self, keyboard_state=None) -> float:
         if worker_stop.is_set() or not self.session_started:
             return 0.0
 
@@ -1472,7 +1568,7 @@ class FireworkNoTrickController:
 
         if task is not None:
             entry, score = task
-            return self._execute_entry(entry, score)
+            return self._execute_entry(entry, score, keyboard_state)
 
         if active:
             now = time.time()
@@ -1498,7 +1594,7 @@ class FireworkNoTrickController:
                     pass
         return 0.0
 
-    def _execute_entry(self, entry, score: float) -> float:
+    def _execute_entry(self, entry, score: float, keyboard_state=None) -> float:
         if entry is None:
             return 0.0
         name = entry.get("name", "")
@@ -1515,6 +1611,10 @@ class FireworkNoTrickController:
             except Exception:
                 pass
             return 0.0
+
+        restore_keys = None
+        if keyboard_state is not None:
+            restore_keys = keyboard_state.suspend()
 
         macro_label = f"赛琪无巧手解密 {base_name}.json"
         log(f"赛琪无巧手解密：回放 {base_name}.json 宏。")
@@ -1533,17 +1633,21 @@ class FireworkNoTrickController:
                 pass
 
         try:
-            play_macro(
-                macro_path,
-                macro_label,
-                0.0,
-                0.0,
-                interrupt_on_exit=False,
-                progress_callback=progress_cb,
-            )
+            try:
+                play_macro(
+                    macro_path,
+                    macro_label,
+                    0.0,
+                    0.0,
+                    interrupt_on_exit=False,
+                    progress_callback=progress_cb,
+                )
+            finally:
+                with self.lock:
+                    self.last_detect_time = time.time()
         finally:
-            with self.lock:
-                self.last_detect_time = time.time()
+            if keyboard_state is not None:
+                keyboard_state.resume(restore_keys)
 
         self.executed_macros += 1
 
