@@ -704,6 +704,171 @@ MOUSE_ACTION_TYPES = {
 }
 
 
+def play_segment_macro(path: str, label: str, progress_callback=None):
+    """回放自定义鼠标轨迹段宏。
+
+    轨迹文件格式：
+    {
+        "segments": [{"from": [x, y], "to": [x, y]}, ...],
+        "recorded_w": 1920,
+        "recorded_h": 1080,
+    }
+    """
+
+    if pyautogui is None:
+        log(f"{label}：未安装 pyautogui 模块，无法回放鼠标轨迹宏。")
+        return None
+
+    if not path or not os.path.exists(path):
+        log(f"{label}：宏文件不存在：{path}")
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log(f"{label}：加载轨迹宏失败：{e}")
+        return None
+
+    segments = data.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return False
+
+    try:
+        recorded_w = float(data.get("recorded_w", 1920))
+    except (TypeError, ValueError):
+        recorded_w = 1920.0
+    if recorded_w <= 0:
+        recorded_w = 1920.0
+
+    try:
+        recorded_h = float(data.get("recorded_h", 1080))
+    except (TypeError, ValueError):
+        recorded_h = 1080.0
+    if recorded_h <= 0:
+        recorded_h = 1080.0
+
+    try:
+        current_w, current_h = pyautogui.size()
+    except Exception:
+        current_w, current_h = int(recorded_w), int(recorded_h)
+
+    scale_x = current_w / recorded_w if recorded_w else 1.0
+    scale_y = current_h / recorded_h if recorded_h else 1.0
+
+    def _parse_point(value):
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            try:
+                return float(value[0]), float(value[1])
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, dict):
+            try:
+                return float(value.get("x")), float(value.get("y"))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    start_point = _parse_point(segments[0].get("from"))
+    if start_point is None:
+        log(f"{label}：轨迹宏缺少起点坐标，已跳过。")
+        return False
+
+    start_x = start_point[0] * scale_x
+    start_y = start_point[1] * scale_y
+
+    total_segments = len(segments)
+    log(f"{label}：共 {total_segments} 段轨迹，按当前分辨率缩放后开始回放。")
+
+    if progress_callback is not None:
+        try:
+            progress_callback(0.0)
+        except Exception:
+            pass
+
+    executed_segments = 0
+    last_percent = 0
+    start_time = time.perf_counter()
+    mouse_held = False
+    result = None
+
+    try:
+        pyautogui.moveTo(int(round(start_x)), int(round(start_y)))
+        time.sleep(0.05)
+        pyautogui.mouseDown(button="left")
+        mouse_held = True
+
+        for idx, seg in enumerate(segments):
+            if worker_stop.is_set():
+                log(f"{label}：检测到停止信号，中断轨迹回放。")
+                break
+
+            target = _parse_point(seg.get("to"))
+            if target is None:
+                log(f"{label}：第 {idx + 1} 段缺少终点坐标，停止回放。")
+                break
+
+            tx = target[0] * scale_x
+            ty = target[1] * scale_y
+
+            try:
+                duration = float(seg.get("duration", 0.05))
+            except (TypeError, ValueError):
+                duration = 0.05
+            if duration < 0:
+                duration = 0.0
+
+            try:
+                pyautogui.moveTo(int(round(tx)), int(round(ty)), duration=duration)
+            except Exception as e:
+                log(f"{label}：移动到第 {idx + 1} 段终点失败：{e}")
+                break
+
+            executed_segments += 1
+
+            progress = executed_segments / total_segments
+            if progress_callback is not None:
+                try:
+                    progress_callback(progress)
+                except Exception:
+                    pass
+
+            percent = int(progress * 100)
+            if percent - last_percent >= 10:
+                log(f"{label} 回放进度：{percent}%（鼠标段:{executed_segments}）")
+                last_percent = percent
+
+        else:
+            # 循环未被 break，确保进度到 100%
+            if progress_callback is not None:
+                try:
+                    progress_callback(1.0)
+                except Exception:
+                    pass
+
+        elapsed = time.perf_counter() - start_time
+
+        if executed_segments >= total_segments:
+            log(f"{label} 执行完成：")
+            log(f"  实际耗时：{elapsed:.3f} 秒")
+            log(f"  执行段数：{executed_segments}/{total_segments}（鼠标:{executed_segments}）")
+            result = True
+        else:
+            log(
+                f"{label}：轨迹回放提前结束（已执行 {executed_segments}/{total_segments} 段）。"
+            )
+            result = None
+
+    finally:
+        if mouse_held:
+            try:
+                pyautogui.mouseUp(button="left")
+            except Exception:
+                pass
+
+    return result
+
+
 def _execute_mouse_action(action: dict, label: str) -> bool:
     if pyautogui is None:
         return False
@@ -834,7 +999,7 @@ def play_macro(
     """
     actions = load_actions(path)
     if not actions:
-        return
+        return False
 
     requires_keyboard = any(act.get("type") in {"key_down", "key_up"} for act in actions)
     requires_mouse = any(act.get("type") in MOUSE_ACTION_TYPES for act in actions)
@@ -986,6 +1151,8 @@ def play_macro(
                 except Exception:
                     pass
 
+    return executed_count > 0
+
 
 class NoTrickDecryptController:
     MATCH_THRESHOLD = 0.7
@@ -1079,19 +1246,33 @@ class NoTrickDecryptController:
         def progress_cb(p):
             self.gui.on_no_trick_progress(p)
 
-        play_macro(
+        executed = False
+        played = play_segment_macro(
             macro_path,
             macro_label,
-            0.0,
-            0.0,
-            interrupt_on_exit=False,
             progress_callback=progress_cb,
         )
 
-        self.macro_executed = True
-        self.gui.on_no_trick_macro_complete(entry)
+        if played is False:
+            executed = play_macro(
+                macro_path,
+                macro_label,
+                0.0,
+                0.0,
+                interrupt_on_exit=False,
+                progress_callback=progress_cb,
+            )
+        elif played:
+            executed = True
+
         end = time.perf_counter()
-        return max(0.0, end - start)
+
+        if executed:
+            self.macro_executed = True
+            self.gui.on_no_trick_macro_complete(entry)
+            return max(0.0, end - start)
+
+        return 0.0
 
     def _monitor_loop(self):
         while not self.stop_event.is_set() and not worker_stop.is_set():
