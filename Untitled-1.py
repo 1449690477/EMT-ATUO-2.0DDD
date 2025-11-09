@@ -704,6 +704,22 @@ MOUSE_ACTION_TYPES = {
 }
 
 
+def macro_has_segments(path: str) -> bool:
+    """Return True when the JSON macro contains segment playback data."""
+
+    if not path or not os.path.exists(path):
+        return False
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+
+    segments = data.get("segments")
+    return isinstance(segments, list) and len(segments) > 0
+
+
 def play_segment_macro(path: str, label: str, progress_callback=None):
     """回放自定义鼠标轨迹段宏。
 
@@ -1247,13 +1263,25 @@ class NoTrickDecryptController:
             self.gui.on_no_trick_progress(p)
 
         executed = False
-        played = play_segment_macro(
-            macro_path,
-            macro_label,
-            progress_callback=progress_cb,
-        )
+        use_segment_macro = bool(entry.get("has_segments"))
 
-        if played is False:
+        if use_segment_macro:
+            played = play_segment_macro(
+                macro_path,
+                macro_label,
+                progress_callback=progress_cb,
+            )
+            if played:
+                executed = True
+            else:
+                use_segment_macro = False
+                if progress_callback is not None:
+                    try:
+                        progress_callback(0.0)
+                    except Exception:
+                        pass
+
+        if not use_segment_macro:
             executed = play_macro(
                 macro_path,
                 macro_label,
@@ -1262,8 +1290,6 @@ class NoTrickDecryptController:
                 interrupt_on_exit=False,
                 progress_callback=progress_cb,
             )
-        elif played:
-            executed = True
 
         end = time.perf_counter()
 
@@ -1329,6 +1355,7 @@ class NoTrickDecryptController:
             base_name = os.path.splitext(name)[0]
             png_path = os.path.join(self.game_dir, name)
             json_path = os.path.join(self.game_dir, base_name + ".json")
+            has_segments = macro_has_segments(json_path)
             try:
                 data = np.fromfile(png_path, dtype=np.uint8)
                 tpl = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
@@ -1341,6 +1368,7 @@ class NoTrickDecryptController:
                     "png_path": png_path,
                     "json_path": json_path,
                     "base_name": base_name,
+                    "has_segments": has_segments,
                     "template": tpl,
                 }
             )
