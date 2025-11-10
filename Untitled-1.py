@@ -159,6 +159,10 @@ DEFAULT_CONFIG = {
         "waves": 10,
         "timeout": 160,
         "hotkey": "",
+        "auto_e_enabled": True,
+        "auto_e_interval": 5.0,
+        "auto_q_enabled": False,
+        "auto_q_interval": 5.0,
     },
     "mod_guard_settings": {
         "waves": 10,
@@ -174,6 +178,10 @@ DEFAULT_CONFIG = {
         "waves": 10,
         "timeout": 160,
         "hotkey": "",
+        "auto_e_enabled": True,
+        "auto_e_interval": 5.0,
+        "auto_q_enabled": False,
+        "auto_q_interval": 5.0,
     },
     "weapon_blueprint_guard_settings": {
         "waves": 10,
@@ -189,6 +197,10 @@ DEFAULT_CONFIG = {
         "waves": 10,
         "timeout": 160,
         "hotkey": "",
+        "auto_e_enabled": True,
+        "auto_e_interval": 5.0,
+        "auto_q_enabled": False,
+        "auto_q_interval": 5.0,
     },
     "xp50_settings": {
         "hotkey": "",
@@ -4388,10 +4400,38 @@ class ExpelFragmentGUI:
         self.log_prefix = getattr(self, "log_prefix", "[驱离]")
         expel_cfg = cfg.get(self.cfg_key, {})
 
+        def _positive_float(value, default):
+            try:
+                val = float(value)
+                if val > 0:
+                    return val
+            except (TypeError, ValueError):
+                pass
+            return default
+
         self.wave_var = tk.StringVar(value=str(expel_cfg.get("waves", 10)))
         self.timeout_var = tk.StringVar(value=str(expel_cfg.get("timeout", 160)))
         self.auto_loop_var = tk.BooleanVar(value=True)
         self.hotkey_var = tk.StringVar(value=expel_cfg.get("hotkey", ""))
+
+        self.auto_e_interval_seconds = _positive_float(
+            expel_cfg.get("auto_e_interval", 5.0), 5.0
+        )
+        self.auto_q_interval_seconds = _positive_float(
+            expel_cfg.get("auto_q_interval", 5.0), 5.0
+        )
+        self.auto_e_enabled_var = tk.BooleanVar(
+            value=bool(expel_cfg.get("auto_e_enabled", True))
+        )
+        self.auto_e_interval_var = tk.StringVar(
+            value=f"{self.auto_e_interval_seconds:g}"
+        )
+        self.auto_q_enabled_var = tk.BooleanVar(
+            value=bool(expel_cfg.get("auto_q_enabled", False))
+        )
+        self.auto_q_interval_var = tk.StringVar(
+            value=f"{self.auto_q_interval_seconds:g}"
+        )
 
         self.selected_letter_path = None
 
@@ -4424,9 +4464,13 @@ class ExpelFragmentGUI:
         self.next_letter_btn = None
         self.letter_page_info_var = None
 
+        self.auto_e_interval_entry = None
+        self.auto_q_interval_entry = None
+
         self._build_ui()
         self._load_letters()
         self._bind_hotkey()
+        self._update_auto_skill_states()
 
     def _build_ui(self):
         tip_top = tk.Label(
@@ -4465,6 +4509,39 @@ class ExpelFragmentGUI:
         tk.Entry(hotkey_frame, textvariable=self.hotkey_var, width=20).pack(side="left", padx=5)
         ttk.Button(hotkey_frame, text="录制热键", command=self._capture_hotkey).pack(side="left", padx=3)
         ttk.Button(hotkey_frame, text="保存设置", command=self._save_settings).pack(side="left", padx=3)
+
+        battle_frame = tk.LabelFrame(self.parent, text="战斗挂机设置")
+        battle_frame.pack(fill="x", padx=10, pady=5)
+
+        e_row = tk.Frame(battle_frame)
+        e_row.pack(fill="x", padx=5, pady=2)
+        self.auto_e_check = tk.Checkbutton(
+            e_row,
+            text="自动释放 E 技能",
+            variable=self.auto_e_enabled_var,
+            command=self._update_auto_skill_states,
+        )
+        self.auto_e_check.pack(side="left")
+        tk.Label(e_row, text="间隔(秒)：").pack(side="left", padx=(10, 2))
+        self.auto_e_interval_entry = tk.Entry(
+            e_row, textvariable=self.auto_e_interval_var, width=6
+        )
+        self.auto_e_interval_entry.pack(side="left")
+
+        q_row = tk.Frame(battle_frame)
+        q_row.pack(fill="x", padx=5, pady=2)
+        self.auto_q_check = tk.Checkbutton(
+            q_row,
+            text="自动释放 Q 技能",
+            variable=self.auto_q_enabled_var,
+            command=self._update_auto_skill_states,
+        )
+        self.auto_q_check.pack(side="left")
+        tk.Label(q_row, text="间隔(秒)：").pack(side="left", padx=(10, 2))
+        self.auto_q_interval_entry = tk.Entry(
+            q_row, textvariable=self.auto_q_interval_var, width=6
+        )
+        self.auto_q_interval_entry.pack(side="left")
 
         self.frame_letters = tk.LabelFrame(
             self.parent,
@@ -4563,6 +4640,35 @@ class ExpelFragmentGUI:
             justify="left",
         )
         self.tip_label.pack(fill="x", padx=10, pady=(0, 8))
+
+    def _update_auto_skill_states(self):
+        state_e = tk.NORMAL if self.auto_e_enabled_var.get() else tk.DISABLED
+        state_q = tk.NORMAL if self.auto_q_enabled_var.get() else tk.DISABLED
+        if self.auto_e_interval_entry is not None:
+            self.auto_e_interval_entry.config(state=state_e)
+        if self.auto_q_interval_entry is not None:
+            self.auto_q_interval_entry.config(state=state_q)
+
+    def _validate_auto_skill_settings(self) -> bool:
+        try:
+            e_interval = float(self.auto_e_interval_var.get().strip())
+            if e_interval <= 0:
+                raise ValueError
+        except (ValueError, AttributeError):
+            messagebox.showwarning("提示", "E 键间隔请输入大于 0 的数字秒数。")
+            return False
+
+        try:
+            q_interval = float(self.auto_q_interval_var.get().strip())
+            if q_interval <= 0:
+                raise ValueError
+        except (ValueError, AttributeError):
+            messagebox.showwarning("提示", "Q 键间隔请输入大于 0 的数字秒数。")
+            return False
+
+        self.auto_e_interval_seconds = e_interval
+        self.auto_q_interval_seconds = q_interval
+        return True
 
     def log(self, msg: str):
         ts = time.strftime("[%H:%M:%S] ")
@@ -4805,10 +4911,16 @@ class ExpelFragmentGUI:
         except ValueError:
             messagebox.showwarning("提示", "局内超时请输入大于 0 的数字秒数。")
             return
+        if not self._validate_auto_skill_settings():
+            return
         section = self.cfg.setdefault(self.cfg_key, {})
         section["waves"] = waves
         section["timeout"] = timeout
         section["hotkey"] = self.hotkey_var.get().strip()
+        section["auto_e_enabled"] = bool(self.auto_e_enabled_var.get())
+        section["auto_e_interval"] = self.auto_e_interval_seconds
+        section["auto_q_enabled"] = bool(self.auto_q_enabled_var.get())
+        section["auto_q_interval"] = self.auto_q_interval_seconds
         self._bind_hotkey()
         save_config(self.cfg)
         messagebox.showinfo("提示", "设置已保存。")
@@ -4832,6 +4944,8 @@ class ExpelFragmentGUI:
                 raise ValueError
         except ValueError:
             messagebox.showwarning("提示", "局内超时请输入大于 0 的数字秒数。")
+            return
+        if not self._validate_auto_skill_settings():
             return
 
         if pyautogui is None or cv2 is None or np is None:
@@ -5081,9 +5195,27 @@ class ExpelFragmentGUI:
             log(f"{self.log_prefix} 无法发送按键。")
             return "stopped"
 
-        log(f"{self.log_prefix} 顺序执行 W/A/S/D（每个 2 秒），并每 5 秒按一次 E（超时 {max_wait:.1f} 秒）。")
+        auto_e_enabled = bool(self.auto_e_enabled_var.get())
+        auto_q_enabled = bool(self.auto_q_enabled_var.get())
+        e_interval = getattr(self, "auto_e_interval_seconds", 5.0)
+        q_interval = getattr(self, "auto_q_interval_seconds", 5.0)
+
+        desc_parts = []
+        if auto_e_enabled:
+            desc_parts.append(f"E 每 {e_interval:g} 秒")
+        if auto_q_enabled:
+            desc_parts.append(f"Q 每 {q_interval:g} 秒")
+        if not desc_parts:
+            desc = "不自动释放技能"
+        else:
+            desc = "，".join(desc_parts)
+
+        log(
+            f"{self.log_prefix} 顺序执行 W/A/S/D（每个 2 秒），{desc}（超时 {max_wait:.1f} 秒）。"
+        )
         start = time.time()
         last_e = start
+        last_q = start
         drop_ui_visible = False
         last_ui_log = 0.0
         min_drop_check_time = 10.0
@@ -5105,9 +5237,12 @@ class ExpelFragmentGUI:
                     self._press_key(active_key)
                     key_end_time = now + 2.0
 
-                if now - last_e >= 5.0:
+                if auto_e_enabled and now - last_e >= e_interval:
                     self._tap_key("e")
                     last_e = now
+                if auto_q_enabled and now - last_q >= q_interval:
+                    self._tap_key("q")
+                    last_q = now
 
                 if now - start >= min_drop_check_time:
                     if not drop_ui_visible:
