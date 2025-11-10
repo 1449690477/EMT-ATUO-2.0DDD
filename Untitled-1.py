@@ -4931,6 +4931,20 @@ class XP50AutoGUI:
         self.left_panel = tk.Frame(self.content_frame)
         self.left_panel.pack(side="left", fill="both", expand=True)
 
+        notice_text = (
+            "主控必须要用🐷猪 必须！ 划线无巧手解密的速度和精度已经调到最佳了 速度基本上和巧手"
+            "一样快 。撤离的时候因为回放精度问题和爆炸怪 有时候会卡住 没办法尽力了理解一下 会自动执行退图重开"
+            "的 大一学生摸鱼写的 有问题 群里 at 我 看到就修！"
+        )
+        tk.Label(
+            self.left_panel,
+            text=notice_text,
+            fg="#d40000",
+            justify="left",
+            anchor="w",
+            wraplength=520,
+        ).pack(fill="x", padx=10, pady=(6, 0))
+
         self.right_panel = tk.Frame(self.content_frame)
         self.right_panel.pack(side="right", fill="y", padx=(5, 10), pady=5)
 
