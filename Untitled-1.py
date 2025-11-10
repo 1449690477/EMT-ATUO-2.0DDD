@@ -15,6 +15,7 @@ import copy
 import queue
 import random
 import importlib.util
+from typing import Optional
 from collections import deque
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
@@ -815,31 +816,63 @@ XP50_MACRO_SEQUENCE = {
 XP50_CLICK_THRESHOLD = 0.75
 XP50_MAP_THRESHOLD = 0.7
 XP50_SERUM_THRESHOLD = 0.75
+XP50_ASSET_CACHE = {}
 
 
 def xp50_template_path(name: str) -> str:
     return os.path.join(XP50_DIR, name)
 
 
-def xp50_fallback_template_path(name: str) -> str:
-    """Return the preferred template path while allowing template-dir fallback.
+def xp50_reset_asset_cache():
+    XP50_ASSET_CACHE.clear()
 
-    部分素材（如开始按钮）仍位于全局 templates 目录，因此当 50XP 文件夹中
-    没有同名文件时需要退回到旧位置。
-    """
 
-    primary = xp50_template_path(name)
+def xp50_find_asset(name: str, allow_templates: bool = False) -> Optional[str]:
+    """Locate a 50XP asset even when stored in nested folders."""
+
+    key = (name, bool(allow_templates))
+    if key in XP50_ASSET_CACHE:
+        cached = XP50_ASSET_CACHE[key]
+        if cached and os.path.exists(cached):
+            return cached
+        if cached:
+            # 缓存的路径已不存在，清理后重新搜索
+            XP50_ASSET_CACHE.pop(key, None)
+        else:
+            return None
+
+    primary = os.path.join(XP50_DIR, name)
     if os.path.exists(primary):
+        XP50_ASSET_CACHE[key] = primary
         return primary
-    return os.path.join(TEMPLATE_DIR, name)
+
+    for root, _, files in os.walk(XP50_DIR):
+        if name in files:
+            found = os.path.join(root, name)
+            XP50_ASSET_CACHE[key] = found
+            return found
+
+    if allow_templates:
+        fallback = os.path.join(TEMPLATE_DIR, name)
+        if os.path.exists(fallback):
+            XP50_ASSET_CACHE[key] = fallback
+            return fallback
+        for root, _, files in os.walk(TEMPLATE_DIR):
+            if name in files:
+                found = os.path.join(root, name)
+                XP50_ASSET_CACHE[key] = found
+                return found
+
+    XP50_ASSET_CACHE[key] = None
+    return None
 
 
 def xp50_wait_and_click(name: str, step_name: str, timeout: float = 20.0, threshold: float = XP50_CLICK_THRESHOLD) -> bool:
-    path = xp50_fallback_template_path(name)
-    if not os.path.exists(path):
+    path = xp50_find_asset(name, allow_templates=True)
+    if not path:
         log(
-            "50XP 模板缺失：{} 或 {}".format(
-                xp50_template_path(name), os.path.join(TEMPLATE_DIR, name)
+            "50XP 模板缺失：{}；已尝试在 {} 及 templates 子目录中查找".format(
+                xp50_template_path(name), XP50_DIR
             )
         )
         return False
@@ -4975,27 +5008,28 @@ class XP50AutoGUI:
         if keyboard is None:
             messagebox.showerror("错误", "未安装 keyboard 模块，无法执行宏。")
             return False
+        xp50_reset_asset_cache()
         missing = []
 
-        start_path = xp50_fallback_template_path(XP50_START_TEMPLATE)
-        if not os.path.exists(start_path):
+        start_path = xp50_find_asset(XP50_START_TEMPLATE, allow_templates=True)
+        if not start_path:
             missing.append(
-                f"{xp50_template_path(XP50_START_TEMPLATE)} (或 {os.path.join(TEMPLATE_DIR, XP50_START_TEMPLATE)})"
+                f"未找到 {XP50_START_TEMPLATE}，请放置于 {XP50_DIR} 或 templates 的任意子目录内"
             )
 
-        serum_path = xp50_template_path(XP50_SERUM_TEMPLATE)
-        if not os.path.exists(serum_path):
-            missing.append(serum_path)
+        serum_path = xp50_find_asset(XP50_SERUM_TEMPLATE)
+        if not serum_path:
+            missing.append(f"未找到 {XP50_SERUM_TEMPLATE}（期望位于 {XP50_DIR} 内）")
 
         for name in XP50_MAP_TEMPLATES.values():
-            path = xp50_template_path(name)
-            if not os.path.exists(path):
-                missing.append(path)
+            path = xp50_find_asset(name)
+            if not path:
+                missing.append(f"未找到 {name}（请放置在 {XP50_DIR} 目录或其子目录）")
         for files in XP50_MACRO_SEQUENCE.values():
             for fname in files:
-                path = xp50_template_path(fname)
-                if not os.path.exists(path):
-                    missing.append(path)
+                path = xp50_find_asset(fname)
+                if not path:
+                    missing.append(f"未找到 {fname}（请放置在 {XP50_DIR} 目录或其子目录）")
         if missing:
             msg = "\n".join(missing)
             messagebox.showerror("错误", f"以下文件缺失：\n{msg}")
@@ -5167,11 +5201,19 @@ class XP50AutoGUI:
 
         chosen = None
         scores = {label: 0.0 for label in XP50_MAP_TEMPLATES}
+        map_paths = {}
+        for label, tpl_name in XP50_MAP_TEMPLATES.items():
+            path = xp50_find_asset(tpl_name)
+            if not path:
+                log(f"{self.LOG_PREFIX} 缺少地图模板：{tpl_name}")
+                self.set_status("地图模板缺失")
+                return False
+            map_paths[label] = path
         self.set_status("识别地图模板…")
         deadline = time.time() + 12.0
         while time.time() < deadline and not worker_stop.is_set():
             for label, tpl_name in XP50_MAP_TEMPLATES.items():
-                path = xp50_template_path(tpl_name)
+                path = map_paths[label]
                 score, _, _ = match_template_from_path(path)
                 scores[label] = score
             log(
@@ -5210,8 +5252,16 @@ class XP50AutoGUI:
             self.set_status("宏文件缺失")
             return False
 
-        for idx, macro_name in enumerate(macros):
-            macro_path = xp50_template_path(macro_name)
+        resolved_macros = []
+        for macro_name in macros:
+            macro_path = xp50_find_asset(macro_name)
+            if not macro_path:
+                log(f"{self.LOG_PREFIX} 缺少宏文件：{macro_name}")
+                self.set_status("宏文件缺失")
+                return False
+            resolved_macros.append((macro_name, macro_path))
+
+        for idx, (macro_name, macro_path) in enumerate(resolved_macros):
             segment = self.PROGRESS_SEGMENTS[min(idx, len(self.PROGRESS_SEGMENTS) - 1)]
             self.set_status(f"执行 {macro_name}…")
             executed = self._run_map_macro(macro_path, macro_name, *segment)
@@ -5272,7 +5322,10 @@ class XP50AutoGUI:
         return bool(executed)
 
     def _wait_for_serum(self, wait_seconds: float) -> bool:
-        template_path = xp50_template_path(XP50_SERUM_TEMPLATE)
+        template_path = xp50_find_asset(XP50_SERUM_TEMPLATE)
+        if not template_path:
+            log(f"{self.LOG_PREFIX} 缺少血清完成模板：{XP50_SERUM_TEMPLATE}")
+            return False
         total = max(0.0, float(wait_seconds or 0.0))
         start_time = time.time()
 
