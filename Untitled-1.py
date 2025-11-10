@@ -791,6 +791,11 @@ class KeyboardPlaybackState:
             except Exception:
                 pass
 
+    def active_keys(self):
+        """Return a snapshot of currently pressed keys."""
+
+        return list(self._active)
+
     def release_all(self):
         if not self._active or keyboard is None:
             self._active.clear()
@@ -877,9 +882,6 @@ def xp50_wait_and_click(name: str, step_name: str, timeout: float = 20.0, thresh
         )
         return False
     return wait_and_click_template_from_path(path, step_name, timeout, threshold)
-
-    def active_keys(self):
-        return list(self._active)
 
 
 def macro_has_segments(path: str) -> bool:
@@ -1464,11 +1466,10 @@ class NoTrickDecryptController:
                     executed = True
                 else:
                     use_segment_macro = False
-                    if progress_callback is not None:
-                        try:
-                            progress_callback(0.0)
-                        except Exception:
-                            pass
+                    try:
+                        progress_cb(0.0)
+                    except Exception:
+                        pass
 
             if not use_segment_macro:
                 executed = play_macro(
