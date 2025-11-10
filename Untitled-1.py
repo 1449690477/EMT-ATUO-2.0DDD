@@ -15,6 +15,8 @@ import copy
 import queue
 import random
 import importlib.util
+from typing import Optional
+from collections import deque
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
@@ -63,9 +65,13 @@ SP_DIR = os.path.join(DATA_DIR, "SP")
 UID_DIR = os.path.join(DATA_DIR, "UID")
 MOD_DIR = os.path.join(DATA_DIR, "mod")
 GAME_DIR = os.path.join(DATA_DIR, "Game")
+GAME_SQ_DIR = os.path.join(DATA_DIR, "GAME-sq")
+XP50_DIR = os.path.join(DATA_DIR, "50XP")
 
 MOD_DIR = resolve_preferred_directory(os.path.join(APP_DIR, "mod"), MOD_DIR)
 GAME_DIR = resolve_preferred_directory(os.path.join(APP_DIR, "Game"), GAME_DIR)
+GAME_SQ_DIR = resolve_preferred_directory(os.path.join(APP_DIR, "GAME-sq"), GAME_SQ_DIR)
+XP50_DIR = resolve_preferred_directory(os.path.join(APP_DIR, "50XP"), XP50_DIR)
 
 # 新项目：人物密函图片 / 掉落物图片
 TEMPLATE_LETTERS_DIR = os.path.join(DATA_DIR, "templates_letters")
@@ -80,6 +86,8 @@ for d in (
     UID_DIR,
     MOD_DIR,
     GAME_DIR,
+    GAME_SQ_DIR,
+    XP50_DIR,
 ):
     ensure_directory(d)
 
@@ -122,6 +130,7 @@ DEFAULT_CONFIG = {
     "macro_a_path": "",
     "macro_b_path": "",
     "auto_loop": False,
+    "firework_no_trick": False,
     "guard_settings": {
         "waves": 10,
         "timeout": 160,
@@ -144,6 +153,13 @@ DEFAULT_CONFIG = {
         "timeout": 160,
         "hotkey": "",
     },
+    "xp50_settings": {
+        "hotkey": "",
+        "wait_seconds": 120.0,
+        "loop_count": 0,
+        "auto_loop": True,
+        "no_trick_decrypt": True,
+    },
 }
 
 GAME_REGION = None
@@ -152,6 +168,7 @@ round_running_lock = threading.Lock()
 hotkey_handle = None
 
 app = None             # 赛琪大烟花 GUI 实例
+xp50_app = None        # 50 经验副本 GUI 实例
 fragment_apps = []     # 人物碎片 GUI 实例列表
 uid_mask_manager = None
 
@@ -241,6 +258,11 @@ def log(msg: str):
     print(ts + msg)
     if app is not None:
         app.log(msg)
+    if xp50_app is not None:
+        try:
+            xp50_app.log(msg)
+        except Exception:
+            pass
     for gui in fragment_apps:
         try:
             gui.log(msg)
@@ -251,6 +273,11 @@ def log(msg: str):
 def report_progress(p: float):
     if app is not None:
         app.set_progress(p)
+    if xp50_app is not None:
+        try:
+            xp50_app.on_global_progress(p)
+        except Exception:
+            pass
 
 
 GOAL_STYLE_INITIALIZED = False
@@ -686,6 +713,471 @@ def load_actions(path: str):
     return acts
 
 
+MOUSE_ACTION_TYPES = {
+    "mouse_move",
+    "mouse_move_relative",
+    "mouse_click",
+    "mouse_down",
+    "mouse_up",
+    "mouse_scroll",
+    "mouse_rotation",
+    "mouse_drag",
+    "mouse_drag_relative",
+}
+
+
+class KeyboardPlaybackState:
+    """Track pressed keys during macro playback.
+
+    The state helps us temporarily release modifiers before running nested
+    decrypt macros so they don't combine with replayed keys to trigger system
+    shortcuts (例如 Win+数字 打开计算器)。
+    """
+
+    def __init__(self):
+        self._active = []
+
+    def press(self, key: str) -> bool:
+        if keyboard is None or not key:
+            return False
+        try:
+            keyboard.press(key)
+            self._active.append(key)
+            return True
+        except Exception:
+            return False
+
+    def release(self, key: str) -> bool:
+        if keyboard is None or not key:
+            return False
+        try:
+            keyboard.release(key)
+        except Exception:
+            return False
+        for idx in range(len(self._active) - 1, -1, -1):
+            if self._active[idx] == key:
+                del self._active[idx]
+                break
+        return True
+
+    def suspend(self):
+        """Release all currently pressed keys and return them for restoration."""
+
+        if not self._active or keyboard is None:
+            keys = list(self._active)
+            self._active.clear()
+            return keys
+
+        keys = list(self._active)
+        for key in reversed(keys):
+            if not key:
+                continue
+            try:
+                keyboard.release(key)
+            except Exception:
+                pass
+        self._active.clear()
+        return keys
+
+    def resume(self, keys):
+        if keyboard is None or not keys:
+            return
+        for key in keys:
+            if not key:
+                continue
+            try:
+                keyboard.press(key)
+                self._active.append(key)
+            except Exception:
+                pass
+
+    def active_keys(self):
+        """Return a snapshot of currently pressed keys."""
+
+        return list(self._active)
+
+    def release_all(self):
+        if not self._active or keyboard is None:
+            self._active.clear()
+            return
+        for key in reversed(self._active):
+            if not key:
+                continue
+            try:
+                keyboard.release(key)
+            except Exception:
+                pass
+        self._active.clear()
+
+
+# ---------- 全自动 50 经验副本资源 ----------
+XP50_START_TEMPLATE = "开始挑战.png"
+XP50_SERUM_TEMPLATE = "血清完成.png"
+XP50_MAP_TEMPLATES = {"A": "mapa.png", "B": "mapb.png"}
+XP50_MACRO_SEQUENCE = {
+    "A": ["mapa-1.json", "mapa-2.json", "mapa-3撤离.json"],
+    "B": ["mapb-1.json", "mapb-2.json", "mapb-3撤离.json"],
+}
+XP50_CLICK_THRESHOLD = 0.75
+XP50_MAP_THRESHOLD = 0.7
+XP50_SERUM_THRESHOLD = 0.75
+XP50_ASSET_CACHE = {}
+
+
+def xp50_template_path(name: str) -> str:
+    return os.path.join(XP50_DIR, name)
+
+
+def xp50_reset_asset_cache():
+    XP50_ASSET_CACHE.clear()
+
+
+def xp50_find_asset(name: str, allow_templates: bool = False) -> Optional[str]:
+    """Locate a 50XP asset even when stored in nested folders."""
+
+    key = (name, bool(allow_templates))
+    if key in XP50_ASSET_CACHE:
+        cached = XP50_ASSET_CACHE[key]
+        if cached and os.path.exists(cached):
+            return cached
+        if cached:
+            # 缓存的路径已不存在，清理后重新搜索
+            XP50_ASSET_CACHE.pop(key, None)
+        else:
+            return None
+
+    primary = os.path.join(XP50_DIR, name)
+    if os.path.exists(primary):
+        XP50_ASSET_CACHE[key] = primary
+        return primary
+
+    for root, _, files in os.walk(XP50_DIR):
+        if name in files:
+            found = os.path.join(root, name)
+            XP50_ASSET_CACHE[key] = found
+            return found
+
+    if allow_templates:
+        fallback = os.path.join(TEMPLATE_DIR, name)
+        if os.path.exists(fallback):
+            XP50_ASSET_CACHE[key] = fallback
+            return fallback
+        for root, _, files in os.walk(TEMPLATE_DIR):
+            if name in files:
+                found = os.path.join(root, name)
+                XP50_ASSET_CACHE[key] = found
+                return found
+
+    XP50_ASSET_CACHE[key] = None
+    return None
+
+
+def xp50_wait_and_click(name: str, step_name: str, timeout: float = 20.0, threshold: float = XP50_CLICK_THRESHOLD) -> bool:
+    path = xp50_find_asset(name, allow_templates=True)
+    if not path:
+        log(
+            "50XP 模板缺失：{}；已尝试在 {} 及 templates 子目录中查找".format(
+                xp50_template_path(name), XP50_DIR
+            )
+        )
+        return False
+    return wait_and_click_template_from_path(path, step_name, timeout, threshold)
+
+
+def macro_has_segments(path: str) -> bool:
+    """Return True when the JSON macro contains segment playback data."""
+
+    if not path or not os.path.exists(path):
+        return False
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+
+    segments = data.get("segments")
+    return isinstance(segments, list) and len(segments) > 0
+
+
+def play_segment_macro(path: str, label: str, progress_callback=None):
+    """回放自定义鼠标轨迹段宏。
+
+    轨迹文件格式：
+    {
+        "segments": [{"from": [x, y], "to": [x, y]}, ...],
+        "recorded_w": 1920,
+        "recorded_h": 1080,
+    }
+    """
+
+    if pyautogui is None:
+        log(f"{label}：未安装 pyautogui 模块，无法回放鼠标轨迹宏。")
+        return None
+
+    if not path or not os.path.exists(path):
+        log(f"{label}：宏文件不存在：{path}")
+        return None
+
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log(f"{label}：加载轨迹宏失败：{e}")
+        return None
+
+    segments = data.get("segments")
+    if not isinstance(segments, list) or not segments:
+        return False
+
+    try:
+        recorded_w = float(data.get("recorded_w", 1920))
+    except (TypeError, ValueError):
+        recorded_w = 1920.0
+    if recorded_w <= 0:
+        recorded_w = 1920.0
+
+    try:
+        recorded_h = float(data.get("recorded_h", 1080))
+    except (TypeError, ValueError):
+        recorded_h = 1080.0
+    if recorded_h <= 0:
+        recorded_h = 1080.0
+
+    try:
+        current_w, current_h = pyautogui.size()
+    except Exception:
+        current_w, current_h = int(recorded_w), int(recorded_h)
+
+    scale_x = current_w / recorded_w if recorded_w else 1.0
+    scale_y = current_h / recorded_h if recorded_h else 1.0
+
+    def _parse_point(value):
+        if isinstance(value, (list, tuple)) and len(value) >= 2:
+            try:
+                return float(value[0]), float(value[1])
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, dict):
+            try:
+                return float(value.get("x")), float(value.get("y"))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    start_point = _parse_point(segments[0].get("from"))
+    if start_point is None:
+        log(f"{label}：轨迹宏缺少起点坐标，已跳过。")
+        return False
+
+    start_x = start_point[0] * scale_x
+    start_y = start_point[1] * scale_y
+
+    total_segments = len(segments)
+    log(f"{label}：共 {total_segments} 段轨迹，按当前分辨率缩放后开始回放。")
+
+    if progress_callback is not None:
+        try:
+            progress_callback(0.0)
+        except Exception:
+            pass
+
+    executed_segments = 0
+    last_percent = 0
+    start_time = time.perf_counter()
+    mouse_held = False
+    result = None
+
+    try:
+        pyautogui.moveTo(int(round(start_x)), int(round(start_y)))
+        time.sleep(0.05)
+        pyautogui.mouseDown(button="left")
+        mouse_held = True
+
+        for idx, seg in enumerate(segments):
+            if worker_stop.is_set():
+                log(f"{label}：检测到停止信号，中断轨迹回放。")
+                break
+
+            target = _parse_point(seg.get("to"))
+            if target is None:
+                log(f"{label}：第 {idx + 1} 段缺少终点坐标，停止回放。")
+                break
+
+            tx = target[0] * scale_x
+            ty = target[1] * scale_y
+
+            try:
+                duration = float(seg.get("duration", 0.05))
+            except (TypeError, ValueError):
+                duration = 0.05
+            if duration < 0:
+                duration = 0.0
+
+            try:
+                pyautogui.moveTo(int(round(tx)), int(round(ty)), duration=duration)
+            except Exception as e:
+                log(f"{label}：移动到第 {idx + 1} 段终点失败：{e}")
+                break
+
+            executed_segments += 1
+
+            progress = executed_segments / total_segments
+            if progress_callback is not None:
+                try:
+                    progress_callback(progress)
+                except Exception:
+                    pass
+
+            percent = int(progress * 100)
+            if percent - last_percent >= 10:
+                log(f"{label} 回放进度：{percent}%（鼠标段:{executed_segments}）")
+                last_percent = percent
+
+        else:
+            # 循环未被 break，确保进度到 100%
+            if progress_callback is not None:
+                try:
+                    progress_callback(1.0)
+                except Exception:
+                    pass
+
+        elapsed = time.perf_counter() - start_time
+
+        if executed_segments >= total_segments:
+            log(f"{label} 执行完成：")
+            log(f"  实际耗时：{elapsed:.3f} 秒")
+            log(f"  执行段数：{executed_segments}/{total_segments}（鼠标:{executed_segments}）")
+            result = True
+        else:
+            log(
+                f"{label}：轨迹回放提前结束（已执行 {executed_segments}/{total_segments} 段）。"
+            )
+            result = None
+
+    finally:
+        if mouse_held:
+            try:
+                pyautogui.mouseUp(button="left")
+            except Exception:
+                pass
+
+    return result
+
+
+def _execute_mouse_action(action: dict, label: str) -> bool:
+    if pyautogui is None:
+        return False
+
+    ttype = action.get("type")
+    try:
+        duration = float(action.get("duration", 0.0) or 0.0)
+    except Exception:
+        duration = 0.0
+
+    if ttype == "mouse_move":
+        try:
+            x = float(action.get("x"))
+            y = float(action.get("y"))
+        except (TypeError, ValueError):
+            log(f"{label}：鼠标移动动作缺少坐标，已跳过。")
+            return False
+        pyautogui.moveTo(int(round(x)), int(round(y)), duration=max(0.0, duration))
+        return True
+
+    if ttype == "mouse_move_relative":
+        try:
+            dx = float(action.get("dx", action.get("x")))
+            dy = float(action.get("dy", action.get("y")))
+        except (TypeError, ValueError):
+            log(f"{label}：相对鼠标移动动作缺少位移，已跳过。")
+            return False
+        pyautogui.moveRel(int(round(dx)), int(round(dy)), duration=max(0.0, duration))
+        return True
+
+    if ttype == "mouse_click":
+        button = action.get("button", "left") or "left"
+        clicks = action.get("clicks", 1)
+        interval = action.get("interval", 0)
+        try:
+            clicks = int(clicks)
+        except (TypeError, ValueError):
+            clicks = 1
+        try:
+            interval = float(interval)
+        except (TypeError, ValueError):
+            interval = 0.0
+        pyautogui.click(clicks=max(1, clicks), interval=max(0.0, interval), button=button)
+        return True
+
+    if ttype == "mouse_down":
+        button = action.get("button", "left") or "left"
+        pyautogui.mouseDown(button=button)
+        return True
+
+    if ttype == "mouse_up":
+        button = action.get("button", "left") or "left"
+        pyautogui.mouseUp(button=button)
+        return True
+
+    if ttype == "mouse_scroll":
+        amount = action.get("amount", action.get("clicks"))
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            log(f"{label}：鼠标滚轮动作缺少数量，已跳过。")
+            return False
+        x = action.get("x")
+        y = action.get("y")
+        try:
+            x = None if x is None else int(round(float(x)))
+            y = None if y is None else int(round(float(y)))
+        except (TypeError, ValueError):
+            x = None
+            y = None
+        pyautogui.scroll(amount, x=x, y=y)
+        return True
+
+    if ttype in {"mouse_drag", "mouse_drag_relative"}:
+        try:
+            dx = float(action.get("dx", action.get("x")))
+            dy = float(action.get("dy", action.get("y")))
+        except (TypeError, ValueError):
+            log(f"{label}：鼠标拖拽动作缺少位移，已跳过。")
+            return False
+        button = action.get("button", "left") or "left"
+        pyautogui.dragRel(int(round(dx)), int(round(dy)), duration=max(0.0, duration), button=button)
+        return True
+
+    if ttype == "mouse_rotation":
+        direction = str(action.get("direction", "")).lower()
+        try:
+            angle = float(action.get("angle", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            angle = 0.0
+        try:
+            sensitivity = float(action.get("sensitivity", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            sensitivity = 1.0
+        magnitude = angle * sensitivity
+        dx = dy = 0.0
+        if direction in ("left", "right"):
+            dx = magnitude if direction == "right" else -magnitude
+        elif direction in ("up", "down"):
+            dy = -magnitude if direction == "up" else magnitude
+        else:
+            log(f"{label}：鼠标旋转方向未知（{direction}），已跳过。")
+            return False
+        dx_i = int(round(dx))
+        dy_i = int(round(dy))
+        if dx_i == 0 and dy_i == 0:
+            return True
+        pyautogui.moveRel(dx_i, dy_i, duration=max(0.0, duration))
+        return True
+
+    return False
+
+
 def play_macro(
     path: str,
     label: str,
@@ -701,12 +1193,19 @@ def play_macro(
     - time.perf_counter + 自旋保证时间精度
     - interrupt_on_exit=True 时，会周期性检测退图界面，发现就提前结束宏
     """
-    if keyboard is None:
-        log("未安装 keyboard 模块，无法回放宏。")
-        return
-
     actions = load_actions(path)
     if not actions:
+        return False
+
+    requires_keyboard = any(act.get("type") in {"key_down", "key_up"} for act in actions)
+    requires_mouse = any(act.get("type") in MOUSE_ACTION_TYPES for act in actions)
+
+    if requires_keyboard and keyboard is None:
+        log("未安装 keyboard 模块，无法回放包含按键的宏。")
+        return
+
+    if requires_mouse and pyautogui is None:
+        log("未安装 pyautogui 模块，无法回放包含鼠标动作的宏。")
         return
 
     if not label:
@@ -719,7 +1218,9 @@ def play_macro(
     start_time = time.perf_counter()
     executed_count = 0
     keyboard_count = 0
+    mouse_count = 0
     last_progress_percent = 0
+    keyboard_state = KeyboardPlaybackState() if requires_keyboard else None
 
     try:
         for i, action in enumerate(actions):
@@ -732,7 +1233,7 @@ def play_macro(
                 break
 
             if interrupter is not None:
-                pause_time = interrupter.run_decrypt_if_needed()
+                pause_time = interrupter.run_decrypt_if_needed(keyboard_state)
                 if pause_time:
                     start_time += pause_time
 
@@ -754,30 +1255,62 @@ def play_macro(
                     chunk = min(0.05, max(sleep_time - 0.0005, 0.0))
                     if chunk > 0:
                         time.sleep(chunk)
-                    pause_time = interrupter.run_decrypt_if_needed()
+                    pause_time = interrupter.run_decrypt_if_needed(keyboard_state)
                     if pause_time:
                         start_time += pause_time
                 while True:
-                    pause_time = interrupter.run_decrypt_if_needed()
+                    pause_time = interrupter.run_decrypt_if_needed(keyboard_state)
                     if pause_time:
                         start_time += pause_time
                         continue
                     if time.perf_counter() - start_time >= target_time:
                         break
 
+            executed = False
             try:
                 ttype = action.get("type", "key_down")
                 key = action.get("key")
-                if ttype == "key_down" and key:
-                    keyboard.press(key)
-                    keyboard_count += 1
-                    executed_count += 1
-                elif ttype == "key_up" and key:
-                    keyboard.release(key)
-                    executed_count += 1
+                if ttype == "key_down" and key and keyboard is not None:
+                    if keyboard_state is not None:
+                        if keyboard_state.press(key):
+                            keyboard_count += 1
+                            executed = True
+                    else:
+                        try:
+                            keyboard.press(key)
+                            keyboard_count += 1
+                            executed = True
+                        except Exception:
+                            pass
+                elif ttype == "key_up" and key and keyboard is not None:
+                    if keyboard_state is not None:
+                        executed = keyboard_state.release(key)
+                    else:
+                        try:
+                            keyboard.release(key)
+                            executed = True
+                        except Exception:
+                            pass
+                elif ttype in MOUSE_ACTION_TYPES:
+                    executed = _execute_mouse_action(action, label)
+                    if executed:
+                        mouse_count += 1
+                elif ttype == "sleep":
+                    try:
+                        delay = float(action.get("duration", action.get("time", 0.0)))
+                    except (TypeError, ValueError):
+                        delay = 0.0
+                    if delay > 0:
+                        time.sleep(delay)
+                    executed = True
+                else:
+                    log(f"{label}：未知动作类型 {ttype}，已跳过。")
             except Exception as e:
                 log(f"{label}：动作 {i} 发送失败：{e}")
                 continue
+
+            if executed:
+                executed_count += 1
 
             local_progress = (i + 1) / total_actions
             global_p = p1 + local_progress * (p2 - p1)
@@ -790,7 +1323,10 @@ def play_macro(
 
             percent = int(local_progress * 100)
             if percent - last_progress_percent >= 10:
-                log(f"{label} 回放进度：{percent}%（键盘:{keyboard_count}）")
+                stats = [f"键盘:{keyboard_count}"]
+                if mouse_count:
+                    stats.append(f"鼠标:{mouse_count}")
+                log(f"{label} 回放进度：{percent}%（{'，'.join(stats)}）")
                 last_progress_percent = percent
 
         actual_elapsed = time.perf_counter() - start_time
@@ -801,27 +1337,23 @@ def play_macro(
         log(f"  实际耗时：{actual_elapsed:.3f} 秒")
         log(f"  时间偏差：{time_diff * 1000:.1f} 毫秒")
         log(f"  时间轴还原精度：{accuracy:.2f}%")
-        log(f"  执行动作：{executed_count}/{total_actions}（键盘:{keyboard_count}）")
+        stats = [f"键盘:{keyboard_count}"]
+        if mouse_count:
+            stats.append(f"鼠标:{mouse_count}")
+        log(f"  执行动作：{executed_count}/{total_actions}（{'，'.join(stats)}）")
 
     finally:
         if interrupter is not None:
-            pause_time = interrupter.run_decrypt_if_needed()
+            pause_time = interrupter.run_decrypt_if_needed(keyboard_state)
             if pause_time:
                 start_time += pause_time
-        pressed = set()
-        for act in actions:
-            if act.get("type") == "key_down":
-                pressed.add(act.get("key"))
-            elif act.get("type") == "key_up":
-                pressed.discard(act.get("key"))
-        if pressed:
-            log(f"{label}：释放未松开的按键：{', '.join(k for k in pressed if k)}")
-            for k in pressed:
-                try:
-                    if k:
-                        keyboard.release(k)
-                except Exception:
-                    pass
+        if keyboard_state is not None:
+            active = keyboard_state.active_keys()
+            if active:
+                log(f"{label}：释放未松开的按键：{', '.join(k for k in active if k)}")
+            keyboard_state.release_all()
+
+    return executed_count > 0
 
 
 class NoTrickDecryptController:
@@ -884,7 +1416,7 @@ class NoTrickDecryptController:
             macro_missing=self.macro_missing,
         )
 
-    def run_decrypt_if_needed(self) -> float:
+    def run_decrypt_if_needed(self, keyboard_state=None) -> float:
         if worker_stop.is_set():
             return 0.0
         with self.trigger_lock:
@@ -906,25 +1438,60 @@ class NoTrickDecryptController:
             self.gui.on_no_trick_macro_missing(entry)
             return 0.0
 
+        restore_keys = None
+        if keyboard_state is not None:
+            restore_keys = keyboard_state.suspend()
+
+        base_name = entry.get("base_name") or os.path.splitext(entry.get("name", ""))[0]
+        macro_label = f"{self.gui.log_prefix} 无巧手解密 {base_name}.json"
+        log(f"{self.gui.log_prefix} 无巧手解密：回放 {base_name}.json 宏。")
+
         start = time.perf_counter()
         self.gui.on_no_trick_macro_start(entry, score)
 
         def progress_cb(p):
             self.gui.on_no_trick_progress(p)
 
-        play_macro(
-            macro_path,
-            f"{self.gui.log_prefix} 无巧手解密 {entry.get('name')}",
-            0.0,
-            0.0,
-            interrupt_on_exit=False,
-            progress_callback=progress_cb,
-        )
+        executed = False
+        use_segment_macro = bool(entry.get("has_segments"))
 
-        self.macro_executed = True
-        self.gui.on_no_trick_macro_complete(entry)
+        try:
+            if use_segment_macro:
+                played = play_segment_macro(
+                    macro_path,
+                    macro_label,
+                    progress_callback=progress_cb,
+                )
+                if played:
+                    executed = True
+                else:
+                    use_segment_macro = False
+                    try:
+                        progress_cb(0.0)
+                    except Exception:
+                        pass
+
+            if not use_segment_macro:
+                executed = play_macro(
+                    macro_path,
+                    macro_label,
+                    0.0,
+                    0.0,
+                    interrupt_on_exit=False,
+                    progress_callback=progress_cb,
+                )
+        finally:
+            if keyboard_state is not None:
+                keyboard_state.resume(restore_keys)
+
         end = time.perf_counter()
-        return max(0.0, end - start)
+
+        if executed:
+            self.macro_executed = True
+            self.gui.on_no_trick_macro_complete(entry)
+            return max(0.0, end - start)
+
+        return 0.0
 
     def _monitor_loop(self):
         while not self.stop_event.is_set() and not worker_stop.is_set():
@@ -978,10 +1545,10 @@ class NoTrickDecryptController:
                 return base
 
         for name in sorted(candidates, key=sort_key):
+            base_name = os.path.splitext(name)[0]
             png_path = os.path.join(self.game_dir, name)
-            json_path = os.path.join(
-                self.game_dir, os.path.splitext(name)[0] + ".json"
-            )
+            json_path = os.path.join(self.game_dir, base_name + ".json")
+            has_segments = macro_has_segments(json_path)
             try:
                 data = np.fromfile(png_path, dtype=np.uint8)
                 tpl = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
@@ -993,11 +1560,401 @@ class NoTrickDecryptController:
                     "name": name,
                     "png_path": png_path,
                     "json_path": json_path,
+                    "base_name": base_name,
+                    "has_segments": has_segments,
                     "template": tpl,
                 }
             )
         return templates
 
+
+class FireworkNoTrickController:
+    MATCH_THRESHOLD = 0.7
+    CHECK_INTERVAL = 0.4
+    COMPLETE_TIMEOUT = 3.0
+    DUPLICATE_COOLDOWN = 1.0
+    MAX_RETRIES = 4
+
+    def __init__(self, gui, game_dir: str):
+        self.gui = gui
+        self.game_dir = game_dir
+        self.stop_event = threading.Event()
+        self.lock = threading.Lock()
+        self.templates = []
+        self.pending = deque()
+        self.pending_names = set()
+        self.recent_hits = {}
+        self.last_detect_time = 0.0
+        self.last_wait_notify = 0.0
+        self.session_started = False
+        self.session_completed = False
+        self.trigger_count = 0
+        self.executed_macros = 0
+        self.macro_missing = False
+        self.active = False
+        self.thread = None
+        self.last_completed_entry = None
+        self.retry_attempts = 0
+        self.verifying_completion = False
+        self.stuck_detected = False
+
+    def start(self) -> bool:
+        if cv2 is None or np is None:
+            log("缺少 opencv/numpy，无法开启无巧手解密监控。")
+            try:
+                self.gui.on_no_trick_unavailable("缺少 opencv/numpy")
+            except Exception:
+                pass
+            return False
+        self.templates = self._load_templates()
+        if not self.templates:
+            try:
+                self.gui.on_no_trick_no_templates(self.game_dir)
+            except Exception:
+                pass
+            return False
+        self.stop_event.clear()
+        self.pending.clear()
+        self.pending_names.clear()
+        self.recent_hits.clear()
+        self.last_detect_time = 0.0
+        self.last_wait_notify = 0.0
+        self.trigger_count = 0
+        self.executed_macros = 0
+        self.macro_missing = False
+        self.active = False
+        self.session_completed = False
+        self.last_completed_entry = None
+        self.retry_attempts = 0
+        self.verifying_completion = False
+        self.stuck_detected = False
+        self.session_started = True
+        self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
+        self.thread.start()
+        try:
+            self.gui.on_no_trick_monitor_started(self.templates)
+        except Exception:
+            pass
+        return True
+
+    def stop(self):
+        self.stop_event.set()
+        self.session_started = False
+
+    def finish_session(self):
+        if self.thread and self.thread.is_alive():
+            self.stop_event.set()
+            try:
+                self.thread.join(timeout=0.5)
+            except Exception:
+                pass
+        self.session_started = False
+        try:
+            self.gui.on_no_trick_session_finished(
+                triggered=self.trigger_count > 0,
+                macro_executed=self.executed_macros > 0,
+                macro_missing=self.macro_missing,
+            )
+        except Exception:
+            pass
+
+    def run_decrypt_if_needed(self, keyboard_state=None) -> float:
+        if worker_stop.is_set() or not self.session_started:
+            return 0.0
+
+        task = None
+        with self.lock:
+            if self.pending:
+                task = self.pending.popleft()
+                entry = task[0]
+                if entry:
+                    self.pending_names.discard(entry.get("name"))
+            active = self.active
+            last_time = self.last_detect_time
+
+        if task is not None:
+            entry, score = task
+            return self._execute_entry(entry, score, keyboard_state)
+
+        if active:
+            now = time.time()
+            elapsed = now - last_time if last_time else 0.0
+            remaining = self.COMPLETE_TIMEOUT - elapsed
+            if remaining > 0:
+                if now - self.last_wait_notify >= 0.3:
+                    self.last_wait_notify = now
+                    if hasattr(self.gui, "on_no_trick_idle"):
+                        try:
+                            self.gui.on_no_trick_idle(max(0.0, remaining))
+                        except Exception:
+                            pass
+                sleep_time = min(self.CHECK_INTERVAL, max(0.05, remaining))
+                time.sleep(sleep_time)
+                return sleep_time
+            finalize = False
+            with self.lock:
+                self.active = False
+                if self.verifying_completion and not self.pending:
+                    finalize = True
+                    self.verifying_completion = False
+            if hasattr(self.gui, "on_no_trick_idle_complete"):
+                try:
+                    self.gui.on_no_trick_idle_complete()
+                except Exception:
+                    pass
+            if finalize:
+                self._mark_session_completed()
+        return 0.0
+
+    def _execute_entry(self, entry, score: float, keyboard_state=None) -> float:
+        if entry is None:
+            return 0.0
+        name = entry.get("name", "")
+        base_name = entry.get("base_name") or os.path.splitext(name)[0]
+        macro_path = entry.get("json_path")
+        with self.lock:
+            if entry is not self.last_completed_entry:
+                self.retry_attempts = 0
+            self.verifying_completion = False
+            self.active = True
+            self.last_detect_time = time.time()
+            self.last_wait_notify = 0.0
+        if not macro_path or not os.path.exists(macro_path):
+            self.macro_missing = True
+            try:
+                self.gui.on_no_trick_macro_missing(entry)
+            except Exception:
+                pass
+            return 0.0
+
+        restore_keys = None
+        if keyboard_state is not None:
+            restore_keys = keyboard_state.suspend()
+
+        macro_label = f"赛琪无巧手解密 {base_name}.json"
+        log(f"赛琪无巧手解密：回放 {base_name}.json 宏。")
+
+        try:
+            self.gui.on_no_trick_macro_start(entry, score)
+        except Exception:
+            pass
+
+        start = time.perf_counter()
+
+        def progress_cb(p):
+            try:
+                self.gui.on_no_trick_progress(p)
+            except Exception:
+                pass
+
+        try:
+            try:
+                play_macro(
+                    macro_path,
+                    macro_label,
+                    0.0,
+                    0.0,
+                    interrupt_on_exit=False,
+                    progress_callback=progress_cb,
+                )
+            finally:
+                with self.lock:
+                    self.last_detect_time = time.time()
+        finally:
+            if keyboard_state is not None:
+                keyboard_state.resume(restore_keys)
+
+        self.executed_macros += 1
+
+        with self.lock:
+            self.last_completed_entry = entry
+            self.verifying_completion = True
+            self.last_detect_time = time.time()
+            self.last_wait_notify = 0.0
+            self.active = True
+
+        try:
+            self.gui.on_no_trick_macro_complete(entry)
+        except Exception:
+            pass
+
+        end = time.perf_counter()
+        return max(0.0, end - start)
+
+    def _monitor_loop(self):
+        while not self.stop_event.is_set() and not worker_stop.is_set():
+            try:
+                img = screenshot_game()
+            except Exception as e:
+                log(f"赛琪无巧手解密：截图失败 {e}")
+                time.sleep(self.CHECK_INTERVAL)
+                continue
+
+            try:
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            except Exception as e:
+                log(f"赛琪无巧手解密：转灰度失败 {e}")
+                time.sleep(self.CHECK_INTERVAL)
+                continue
+
+            detected = False
+            for entry in self.templates:
+                tpl = entry.get("template")
+                if tpl is None:
+                    continue
+                try:
+                    res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, _ = cv2.minMaxLoc(res)
+                except Exception as e:
+                    log(f"赛琪无巧手解密：匹配 {entry.get('name')} 失败：{e}")
+                    continue
+                if max_val >= self.MATCH_THRESHOLD:
+                    self._queue_detection(entry, max_val)
+                    detected = True
+            if not detected:
+                time.sleep(self.CHECK_INTERVAL)
+
+    def _queue_detection(self, entry, score: float):
+        now = time.time()
+        name = entry.get("name")
+        if self._handle_post_completion_detection(entry, score, now):
+            return
+        with self.lock:
+            if self.session_completed:
+                return
+            last_hit = self.recent_hits.get(name, 0.0)
+            if name in self.pending_names and now - last_hit < self.DUPLICATE_COOLDOWN:
+                return
+            if now - last_hit < self.DUPLICATE_COOLDOWN:
+                return
+            self.pending.append((entry, score))
+            if name is not None:
+                self.pending_names.add(name)
+                self.recent_hits[name] = now
+            self.last_detect_time = now
+            self.active = True
+            self.last_wait_notify = 0.0
+        self.trigger_count += 1
+        try:
+            self.gui.on_no_trick_detected(entry, score)
+        except Exception:
+            pass
+
+    def _load_templates(self):
+        templates = []
+        if not os.path.isdir(self.game_dir):
+            return templates
+        try:
+            candidates = [
+                f
+                for f in os.listdir(self.game_dir)
+                if f.lower().endswith(".png")
+            ]
+        except Exception as e:
+            log(f"读取 {self.game_dir} 目录失败：{e}")
+            return templates
+
+        for name in sorted(candidates):
+            base_name = os.path.splitext(name)[0]
+            png_path = os.path.join(self.game_dir, name)
+            json_path = os.path.join(self.game_dir, base_name + ".json")
+            try:
+                data = np.fromfile(png_path, dtype=np.uint8)
+                tpl = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
+            except Exception as e:
+                log(f"赛琪无巧手解密：读取模板 {png_path} 失败：{e}")
+                tpl = None
+            templates.append(
+                {
+                    "name": name,
+                    "png_path": png_path,
+                    "json_path": json_path,
+                    "base_name": base_name,
+                    "template": tpl,
+                }
+            )
+        return templates
+
+    def _handle_post_completion_detection(self, entry, score: float, now: float) -> bool:
+        with self.lock:
+            if not self.verifying_completion:
+                return False
+            retry_entry = self.last_completed_entry
+            attempts = self.retry_attempts
+            self.verifying_completion = False
+        if retry_entry is None:
+            return False
+
+        name = entry.get("name")
+        if name:
+            with self.lock:
+                self.recent_hits[name] = now
+
+        try:
+            self.gui.on_no_trick_detected(entry, score)
+        except Exception:
+            pass
+
+        base_name = retry_entry.get("base_name") or os.path.splitext(retry_entry.get("name", ""))[0]
+
+        with self.lock:
+            self.trigger_count += 1
+
+        if attempts < self.MAX_RETRIES:
+            attempt_no = attempts + 1
+            log(
+                f"赛琪无巧手解密：检测到 {name or '解密图像'}，判定 {base_name}.json 解密失败，准备第 {attempt_no} 次重试。"
+            )
+            with self.lock:
+                self.retry_attempts = attempt_no
+                self.pending.appendleft((retry_entry, score))
+                retry_name = retry_entry.get("name")
+                if retry_name is not None:
+                    self.pending_names.add(retry_name)
+                    self.recent_hits[retry_name] = now
+                self.last_detect_time = now
+                self.last_wait_notify = 0.0
+                self.active = True
+            try:
+                if hasattr(self.gui, "on_no_trick_retry"):
+                    self.gui.on_no_trick_retry(retry_entry, attempt_no)
+            except Exception:
+                pass
+        else:
+            log(
+                f"赛琪无巧手解密：{base_name}.json 连续 {self.MAX_RETRIES} 次失败，判定卡死。"
+            )
+            with self.lock:
+                self.stuck_detected = True
+                self.session_completed = True
+                self.session_started = False
+                self.pending.clear()
+                self.pending_names.clear()
+                self.active = False
+                self.last_wait_notify = 0.0
+            self.stop_event.set()
+            try:
+                if hasattr(self.gui, "on_no_trick_stuck"):
+                    self.gui.on_no_trick_stuck(retry_entry)
+            except Exception:
+                pass
+        return True
+
+    def _mark_session_completed(self):
+        self.session_completed = True
+        self.session_started = False
+        self.stop_event.set()
+        with self.lock:
+            self.pending.clear()
+            self.pending_names.clear()
+            self.active = False
+            self.last_wait_notify = 0.0
+            self.verifying_completion = False
+            self.last_completed_entry = None
+            self.retry_attempts = 0
+
+    def was_stuck(self) -> bool:
+        return self.stuck_detected
 
 # ======================================================================
 #  赛琪大烟花（老项目）
@@ -1046,7 +2003,8 @@ def emergency_recover():
 def run_one_round(wait_interval: float,
                   macro_a: str,
                   macro_b: str,
-                  skip_enter_buttons: bool):
+                  skip_enter_buttons: bool,
+                  gui=None):
     log("===== 赛琪大烟花：新一轮开始 =====")
     report_progress(0.0)
 
@@ -1067,7 +2025,27 @@ def run_one_round(wait_interval: float,
         time.sleep(0.1)
     report_progress(0.3)
 
-    play_macro(macro_a, "A 阶段（靠近大烟花）", 0.3, 0.6, interrupt_on_exit=True)
+    controller = gui._start_firework_no_trick_monitor() if gui is not None else None
+    try:
+        play_macro(
+            macro_a,
+            "A 阶段（靠近大烟花）",
+            0.3,
+            0.6,
+            interrupt_on_exit=True,
+            interrupter=controller,
+        )
+    finally:
+        if controller is not None and gui is not None:
+            stuck = controller.was_stuck()
+            controller.stop()
+            controller.finish_session()
+            gui._clear_firework_no_trick_controller(controller)
+            if stuck:
+                log("赛琪无巧手解密：连续解密失败，执行防卡死流程。")
+                emergency_recover()
+                return
+            controller = None
     if worker_stop.is_set():
         return
 
@@ -1094,14 +2072,15 @@ def run_one_round(wait_interval: float,
 def worker_loop(wait_interval: float,
                 macro_a: str,
                 macro_b: str,
-                auto_loop: bool):
+                auto_loop: bool,
+                gui=None):
     try:
         first_round = True
         while not worker_stop.is_set():
             skip_enter = (auto_loop and not first_round)
             if skip_enter:
                 log("自动循环：本轮跳过 enter_step1/2，只从地图确认(map1)开始。")
-            run_one_round(wait_interval, macro_a, macro_b, skip_enter)
+            run_one_round(wait_interval, macro_a, macro_b, skip_enter, gui=gui)
             first_round = False
             if worker_stop.is_set() or not auto_loop:
                 break
@@ -1126,11 +2105,26 @@ class MainGUI:
         self.macro_b_var = tk.StringVar(value=cfg.get("macro_b_path", ""))
         self.auto_loop_var = tk.BooleanVar(value=cfg.get("auto_loop", False))
         self.progress_var = tk.DoubleVar(value=0.0)
+        self.no_trick_var = tk.BooleanVar(value=cfg.get("firework_no_trick", False))
+        self.no_trick_status_var = tk.StringVar(value="未启用")
+        self.no_trick_progress_var = tk.DoubleVar(value=0.0)
+        self.no_trick_controller = None
+        self.no_trick_image_ref = None
+        self._last_idle_remaining = None
 
         self._build_ui()
 
     def _build_ui(self):
-        top = tk.Frame(self.root)
+        self.content_frame = tk.Frame(self.root)
+        self.content_frame.pack(fill="both", expand=True)
+
+        self.left_panel = tk.Frame(self.content_frame)
+        self.left_panel.pack(side="left", fill="both", expand=True)
+
+        self.right_panel = tk.Frame(self.content_frame)
+        self.right_panel.pack(side="right", fill="y", padx=(5, 10), pady=5)
+
+        top = tk.Frame(self.left_panel)
         top.pack(fill="x", padx=10, pady=5)
 
         tk.Label(top, text="热键:").grid(row=0, column=0, sticky="e")
@@ -1142,7 +2136,16 @@ class MainGUI:
         tk.Entry(top, textvariable=self.wait_var, width=8).grid(row=1, column=1, sticky="w")
         tk.Checkbutton(top, text="自动循环", variable=self.auto_loop_var).grid(row=1, column=2, sticky="w")
 
-        frm2 = tk.LabelFrame(self.root, text="宏设置")
+        toggle = tk.Frame(self.left_panel)
+        toggle.pack(fill="x", padx=10, pady=(0, 5))
+        tk.Checkbutton(
+            toggle,
+            text="开启无巧手解密",
+            variable=self.no_trick_var,
+            command=self._on_no_trick_toggle,
+        ).pack(anchor="w")
+
+        frm2 = tk.LabelFrame(self.left_panel, text="宏设置")
         frm2.pack(fill="x", padx=10, pady=5)
 
         tk.Label(frm2, text="A 宏（靠近大烟花）:").grid(row=0, column=0, sticky="e")
@@ -1153,14 +2156,14 @@ class MainGUI:
         tk.Entry(frm2, textvariable=self.macro_b_var, width=60).grid(row=1, column=1, sticky="w")
         ttk.Button(frm2, text="浏览…", command=self.choose_b).grid(row=1, column=2, padx=3)
 
-        frm3 = tk.Frame(self.root)
+        frm3 = tk.Frame(self.left_panel)
         frm3.pack(padx=10, pady=5)
 
         ttk.Button(frm3, text="开始监听热键", command=self.start_listen).grid(row=0, column=0, padx=3)
         ttk.Button(frm3, text="停止", command=self.stop_listen).grid(row=0, column=1, padx=3)
         ttk.Button(frm3, text="只执行一轮", command=self.run_once).grid(row=0, column=2, padx=3)
 
-        frm4 = tk.LabelFrame(self.root, text="日志")
+        frm4 = tk.LabelFrame(self.left_panel, text="日志")
         frm4.pack(fill="both", expand=True, padx=10, pady=5)
 
         self.log_text = tk.Text(frm4, height=10)
@@ -1170,12 +2173,321 @@ class MainGUI:
         self.log_text.config(yscrollcommand=sb.set)
 
         self.progress = ttk.Progressbar(
-            self.root,
+            self.left_panel,
             variable=self.progress_var,
             maximum=100.0,
             mode="determinate",
         )
         self.progress.pack(fill="x", padx=10, pady=5)
+
+        self.no_trick_status_frame = tk.LabelFrame(self.right_panel, text="无巧手解密状态")
+        self.no_trick_status_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        status_inner = tk.Frame(self.no_trick_status_frame)
+        status_inner.pack(fill="x", padx=5, pady=5)
+
+        self.no_trick_status_label = tk.Label(
+            status_inner,
+            textvariable=self.no_trick_status_var,
+            anchor="w",
+            justify="left",
+        )
+        self.no_trick_status_label.pack(fill="x", anchor="w")
+
+        self.no_trick_image_label = tk.Label(
+            self.no_trick_status_frame,
+            relief="sunken",
+            bd=1,
+            bg="#f8f8f8",
+        )
+        self.no_trick_image_label.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+
+        self.no_trick_progress = ttk.Progressbar(
+            self.no_trick_status_frame,
+            variable=self.no_trick_progress_var,
+            maximum=100.0,
+            mode="determinate",
+        )
+        self.no_trick_progress.pack(fill="x", padx=10, pady=(0, 8))
+
+        self._update_no_trick_ui()
+
+    def _on_no_trick_toggle(self):
+        if not self.no_trick_var.get():
+            self._stop_firework_no_trick_monitor()
+        self._update_no_trick_ui()
+
+    def _update_no_trick_ui(self):
+        if self.no_trick_var.get():
+            self._set_no_trick_status("等待刷图时识别解密图像…")
+            self._set_no_trick_progress(0.0)
+            self._set_no_trick_image(None)
+        else:
+            self._set_no_trick_status("未启用")
+            self._set_no_trick_progress(0.0)
+            self._set_no_trick_image(None)
+
+    def _set_no_trick_status(self, text: str):
+        self.no_trick_status_var.set(text)
+
+    def _set_no_trick_progress(self, percent: float):
+        self.no_trick_progress_var.set(max(0.0, min(100.0, percent)))
+
+    def _set_no_trick_image(self, photo):
+        if photo is None:
+            self.no_trick_image_label.config(image="")
+        else:
+            self.no_trick_image_label.config(image=photo)
+        self.no_trick_image_ref = photo
+
+    def _load_no_trick_preview(self, path: str, max_size: int = 240):
+        if not path or not os.path.exists(path):
+            return None
+        if Image is not None and ImageTk is not None:
+            try:
+                with Image.open(path) as pil_img:
+                    pil_img = pil_img.convert("RGBA")
+                    w, h = pil_img.size
+                    scale = 1.0
+                    if max(w, h) > max_size:
+                        scale = max_size / max(w, h)
+                        pil_img = pil_img.resize(
+                            (
+                                max(1, int(w * scale)),
+                                max(1, int(h * scale)),
+                            ),
+                            Image.LANCZOS,
+                        )
+                    return ImageTk.PhotoImage(pil_img)
+            except Exception:
+                pass
+        try:
+            img = tk.PhotoImage(file=path)
+        except Exception:
+            return None
+        w = max(img.width(), 1)
+        h = max(img.height(), 1)
+        factor = max(1, (max(w, h) + max_size - 1) // max_size)
+        if factor > 1:
+            img = img.subsample(factor, factor)
+        return img
+
+    def _start_firework_no_trick_monitor(self):
+        if not self.no_trick_var.get():
+            return None
+        if self.no_trick_controller is not None:
+            return self.no_trick_controller
+        controller = FireworkNoTrickController(self, GAME_SQ_DIR)
+        if controller.start():
+            self.no_trick_controller = controller
+            self._last_idle_remaining = None
+            return controller
+        return None
+
+    def _stop_firework_no_trick_monitor(self):
+        controller = self.no_trick_controller
+        if controller is None:
+            return
+        controller.stop()
+        controller.finish_session()
+        self.no_trick_controller = None
+
+    def _clear_firework_no_trick_controller(self, controller):
+        if self.no_trick_controller is controller:
+            self.no_trick_controller = None
+
+    # ---- 无巧手解密回调 ----
+    def on_no_trick_unavailable(self, reason: str):
+        if not self.no_trick_var.get():
+            return
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            self._set_no_trick_status(f"无巧手解密不可用：{reason}。")
+            self._set_no_trick_progress(0.0)
+            self._set_no_trick_image(None)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_no_templates(self, game_dir: str):
+        if not self.no_trick_var.get():
+            return
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            self._set_no_trick_status(
+                "GAME-sq 文件夹中未找到解密图像，请放置 PNG 和对应 JSON。"
+            )
+            self._set_no_trick_progress(0.0)
+            self._set_no_trick_image(None)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_monitor_started(self, templates):
+        if not self.no_trick_var.get():
+            return
+        total = len(templates)
+        valid = sum(1 for t in templates if t.get("template") is not None)
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            if valid <= 0:
+                self._set_no_trick_status("无有效模板，无法识别解密图像。")
+            else:
+                self._set_no_trick_status(f"等待识别解密图像（共 {total} 张模板）…")
+            self._set_no_trick_progress(0.0)
+            self._set_no_trick_image(None)
+            self._last_idle_remaining = None
+
+        post_to_main_thread(_)
+
+    def on_no_trick_detected(self, entry, score: float):
+        if not self.no_trick_var.get():
+            return
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            name = entry.get("name", "")
+            self._set_no_trick_status(f"已识别解密图像：{name}，开始执行宏…")
+            self._set_no_trick_progress(0.0)
+            photo = self._load_no_trick_preview(entry.get("png_path"))
+            self._set_no_trick_image(photo)
+            self._last_idle_remaining = None
+
+        post_to_main_thread(_)
+
+    def on_no_trick_macro_start(self, entry, score: float):
+        if not self.no_trick_var.get():
+            return
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            self._set_no_trick_progress(0.0)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_progress(self, progress: float):
+        if not self.no_trick_var.get():
+            return
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            self._set_no_trick_progress(progress * 100.0)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_macro_complete(self, entry):
+        if not self.no_trick_var.get():
+            return
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            name = entry.get("name", "")
+            self._set_no_trick_status(f"{name} 解密完成。")
+            self._set_no_trick_progress(100.0)
+            self._last_idle_remaining = None
+
+        post_to_main_thread(_)
+
+    def on_no_trick_retry(self, entry, attempt_no: int):
+        if not self.no_trick_var.get():
+            return
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            base = os.path.splitext(entry.get("name", ""))[0]
+            self._set_no_trick_status(
+                f"{base} 解密失败，准备第 {attempt_no} 次重试…"
+            )
+            self._set_no_trick_progress(0.0)
+            self._last_idle_remaining = None
+
+        post_to_main_thread(_)
+
+    def on_no_trick_stuck(self, entry):
+        if not self.no_trick_var.get():
+            return
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            base = os.path.splitext(entry.get("name", ""))[0]
+            self._set_no_trick_status(f"{base} 解密失败，执行防卡死…")
+            self._set_no_trick_progress(0.0)
+            self._last_idle_remaining = None
+
+        post_to_main_thread(_)
+
+    def on_no_trick_macro_missing(self, entry):
+        if not self.no_trick_var.get():
+            return
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            base = os.path.splitext(entry.get("name", ""))[0]
+            self._set_no_trick_status(f"未找到 {base}.json，跳过本次解密。")
+            self._set_no_trick_progress(0.0)
+            self._set_no_trick_image(None)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_idle(self, remaining: float):
+        if not self.no_trick_var.get():
+            return
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            if self._last_idle_remaining is not None and abs(self._last_idle_remaining - remaining) < 0.1:
+                return
+            self._last_idle_remaining = remaining
+            self._set_no_trick_status(
+                f"等待下一张解密图像…（约 {remaining:.1f} 秒）"
+            )
+
+        post_to_main_thread(_)
+
+    def on_no_trick_idle_complete(self):
+        if not self.no_trick_var.get():
+            return
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            self._set_no_trick_status("解密流程结束，恢复原宏执行。")
+            self._set_no_trick_progress(100.0)
+            self._last_idle_remaining = None
+
+        post_to_main_thread(_)
+
+    def on_no_trick_session_finished(self, triggered: bool, macro_executed: bool, macro_missing: bool):
+        if not self.no_trick_var.get():
+            return
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            if not triggered:
+                self._set_no_trick_status("本轮未识别到解密图像。")
+                self._set_no_trick_progress(0.0)
+                self._set_no_trick_image(None)
+            elif macro_executed:
+                self._set_no_trick_status("解密流程完成，继续执行原宏。")
+                self._set_no_trick_progress(100.0)
+            elif macro_missing:
+                # 状态已在缺失回调中更新
+                pass
+
+        post_to_main_thread(_)
 
     def log(self, msg: str):
         ts = time.strftime("[%H:%M:%S] ")
@@ -1227,6 +2539,7 @@ class MainGUI:
                 "macro_a_path": self.macro_a_var.get(),
                 "macro_b_path": self.macro_b_var.get(),
                 "auto_loop": self.auto_loop_var.get(),
+                "firework_no_trick": bool(self.no_trick_var.get()),
             }
             save_config(cfg)
         except Exception as e:
@@ -1291,7 +2604,7 @@ class MainGUI:
 
         def worker():
             try:
-                worker_loop(wait_sec, macro_a, macro_b, auto_loop)
+                worker_loop(wait_sec, macro_a, macro_b, auto_loop, gui=self)
             finally:
                 round_running_lock.release()
         threading.Thread(target=worker, daemon=True).start()
@@ -1377,6 +2690,10 @@ class FragmentFarmGUI:
         self.wave_progress_var = tk.DoubleVar(value=0.0)
         self.wave_progress_label_var = tk.StringVar(value="轮次进度：0/0")
 
+        self.content_frame = None
+        self.left_panel = None
+        self.right_panel = None
+
         self._build_ui()
         self._load_letters()
         self._update_wave_progress_ui()
@@ -1394,7 +2711,19 @@ class FragmentFarmGUI:
         )
         tip_top.pack(fill="x", padx=10, pady=3)
 
-        top = tk.Frame(self.parent)
+        self.content_frame = tk.Frame(self.parent)
+        self.content_frame.pack(fill="both", expand=True)
+
+        self.left_panel = tk.Frame(self.content_frame)
+        self.left_panel.pack(side="left", fill="both", expand=True)
+
+        if self.enable_no_trick_decrypt:
+            self.right_panel = tk.Frame(self.content_frame)
+            self.right_panel.pack(side="right", fill="y", padx=(5, 10), pady=5)
+        else:
+            self.right_panel = None
+
+        top = tk.Frame(self.left_panel)
         top.pack(fill="x", padx=10, pady=5)
 
         tk.Label(top, text="总波数:").grid(row=0, column=0, sticky="e")
@@ -1411,7 +2740,7 @@ class FragmentFarmGUI:
             variable=self.auto_loop_var,
         ).grid(row=0, column=6, sticky="w", padx=10)
 
-        hotkey_frame = tk.Frame(self.parent)
+        hotkey_frame = tk.Frame(self.left_panel)
         hotkey_frame.pack(fill="x", padx=10, pady=5)
         self.hotkey_label_widget = tk.Label(
             hotkey_frame, text=f"刷{self.product_short_label}热键:"
@@ -1422,7 +2751,7 @@ class FragmentFarmGUI:
         ttk.Button(hotkey_frame, text="保存设置", command=self._save_settings).pack(side="left", padx=3)
 
         if self.enable_no_trick_decrypt:
-            toggle_frame = tk.Frame(self.parent)
+            toggle_frame = tk.Frame(self.left_panel)
             toggle_frame.pack(fill="x", padx=10, pady=(0, 5))
             tk.Checkbutton(
                 toggle_frame,
@@ -1432,7 +2761,7 @@ class FragmentFarmGUI:
             ).pack(anchor="w")
 
         self.frame_letters = tk.LabelFrame(
-            self.parent,
+            self.left_panel,
             text=f"{self.letter_label}选择（来自 {self.letters_dir_hint}/）",
         )
         self.frame_letters.pack(fill="both", expand=True, padx=10, pady=5)
@@ -1446,7 +2775,7 @@ class FragmentFarmGUI:
         )
         self.selected_label_widget.pack(anchor="w", padx=5, pady=3)
 
-        frame_macros = tk.LabelFrame(self.parent, text="地图宏脚本（mapA / mapB）")
+        frame_macros = tk.LabelFrame(self.left_panel, text="地图宏脚本（mapA / mapB）")
         frame_macros.pack(fill="x", padx=10, pady=5)
         frame_macros.grid_columnconfigure(1, weight=1)
 
@@ -1459,7 +2788,7 @@ class FragmentFarmGUI:
         ttk.Button(frame_macros, text="浏览…", command=self._choose_macro_b).grid(row=1, column=2, padx=3)
 
         if self.enable_no_trick_decrypt:
-            self.no_trick_status_frame = tk.LabelFrame(self.parent, text="无巧手解密状态")
+            self.no_trick_status_frame = tk.LabelFrame(self.right_panel, text="无巧手解密状态")
             status_inner = tk.Frame(self.no_trick_status_frame)
             status_inner.pack(fill="x", padx=5, pady=5)
 
@@ -1477,7 +2806,7 @@ class FragmentFarmGUI:
                 bd=1,
                 bg="#f8f8f8",
             )
-            self.no_trick_image_label.pack(fill="both", padx=10, pady=(0, 5))
+            self.no_trick_image_label.pack(fill="both", expand=True, padx=10, pady=(0, 5))
 
             self.no_trick_progress = ttk.Progressbar(
                 self.no_trick_status_frame,
@@ -1488,7 +2817,7 @@ class FragmentFarmGUI:
             self.no_trick_progress.pack(fill="x", padx=10, pady=(0, 8))
 
         self.stats_frame = tk.LabelFrame(
-            self.parent, text=f"{self.product_label}统计（实时）"
+            self.left_panel, text=f"{self.product_label}统计（实时）"
         )
         self.stats_frame.pack(fill="x", padx=10, pady=5)
 
@@ -1522,7 +2851,7 @@ class FragmentFarmGUI:
         tk.Label(self.stats_frame, textvariable=self.eff_str_var).grid(row=2, column=4, sticky="w")
 
         ensure_goal_progress_style()
-        progress_box = tk.LabelFrame(self.parent, text="轮次进度")
+        progress_box = tk.LabelFrame(self.left_panel, text="轮次进度")
         progress_box.pack(fill="x", padx=10, pady=5)
         ttk.Progressbar(
             progress_box,
@@ -1532,7 +2861,7 @@ class FragmentFarmGUI:
         ).pack(fill="x", padx=10, pady=5)
         tk.Label(progress_box, textvariable=self.wave_progress_label_var, anchor="e").pack(fill="x", padx=10, pady=(0, 5))
 
-        ctrl = tk.Frame(self.parent)
+        ctrl = tk.Frame(self.left_panel)
         ctrl.pack(fill="x", padx=10, pady=5)
         self.start_btn = ttk.Button(
             ctrl, text=f"开始刷{self.product_short_label}", command=lambda: self.start_farming()
@@ -1541,7 +2870,7 @@ class FragmentFarmGUI:
         self.stop_btn = ttk.Button(ctrl, text="停止", command=lambda: self.stop_farming())
         self.stop_btn.pack(side="left", padx=3)
 
-        self.log_frame = tk.LabelFrame(self.parent, text=f"{self.product_label}日志")
+        self.log_frame = tk.LabelFrame(self.left_panel, text=f"{self.product_label}日志")
         self.log_frame.pack(fill="both", expand=True, padx=10, pady=5)
         self.log_text = tk.Text(self.log_frame, height=10)
         self.log_text.pack(side="left", fill="both", expand=True)
@@ -1751,7 +3080,7 @@ class FragmentFarmGUI:
         ):
             return
         if not self.no_trick_status_frame.winfo_ismapped():
-            self.no_trick_status_frame.pack(fill="x", padx=10, pady=5)
+            self.no_trick_status_frame.pack(fill="both", expand=True, padx=5, pady=5)
 
     def _hide_no_trick_frame(self):
         if not self.enable_no_trick_decrypt or self.no_trick_status_frame is None:
@@ -3396,10 +4725,895 @@ class ModExpelGUI(ExpelFragmentGUI):
 
 
 # ======================================================================
+#  全自动 50 人物经验副本
+# ======================================================================
+class XP50AutoGUI:
+    LOG_PREFIX = "[50XP]"
+    MAP_STABILIZE_DELAY = 2.0
+    BETWEEN_ROUNDS_DELAY = 3.0
+    WAIT_POLL_INTERVAL = 0.3
+    PROGRESS_SEGMENTS = (
+        (20.0, 45.0),
+        (45.0, 65.0),
+        (85.0, 100.0),
+    )
+    WAIT_PROGRESS_RANGE = (65.0, 85.0)
+
+    def __init__(self, root, cfg):
+        self.root = root
+        self.cfg = cfg
+        self.log_prefix = self.LOG_PREFIX
+
+        settings = cfg.get("xp50_settings", {})
+        self.hotkey_var = tk.StringVar(value=settings.get("hotkey", ""))
+        self.wait_var = tk.StringVar(value=str(settings.get("wait_seconds", 120.0)))
+        self.loop_count_var = tk.StringVar(value=str(settings.get("loop_count", 0)))
+        self.auto_loop_var = tk.BooleanVar(value=bool(settings.get("auto_loop", True)))
+        self.no_trick_var = tk.BooleanVar(value=bool(settings.get("no_trick_decrypt", True)))
+
+        self.progress_var = tk.DoubleVar(value=0.0)
+        self.progress_message_var = tk.StringVar(value="等待开始")
+        self.wait_message_var = tk.StringVar(value="")
+        self.serum_status_var = tk.StringVar(value="尚未识别血清完成")
+
+        self.serum_image_ref = None
+        self.no_trick_controller = None
+        self.no_trick_status_var = tk.StringVar(value="未启用")
+        self.no_trick_progress_var = tk.DoubleVar(value=0.0)
+        self.no_trick_image_ref = None
+
+        self.log_text = None
+        self.progress = None
+        self.serum_preview_label = None
+        self.no_trick_status_frame = None
+        self.no_trick_image_label = None
+        self.no_trick_progress = None
+        self.hotkey_handle = None
+        self.running = False
+
+        self._build_ui()
+        self._update_no_trick_ui()
+
+    # ---- UI 构建 ----
+    def _build_ui(self):
+        self.content_frame = tk.Frame(self.root)
+        self.content_frame.pack(fill="both", expand=True)
+
+        self.left_panel = tk.Frame(self.content_frame)
+        self.left_panel.pack(side="left", fill="both", expand=True)
+
+        self.right_panel = tk.Frame(self.content_frame)
+        self.right_panel.pack(side="right", fill="y", padx=(5, 10), pady=5)
+
+        top = tk.Frame(self.left_panel)
+        top.pack(fill="x", padx=10, pady=5)
+        top.grid_columnconfigure(4, weight=1)
+
+        tk.Label(top, text="热键:").grid(row=0, column=0, sticky="e")
+        tk.Entry(top, textvariable=self.hotkey_var, width=15).grid(row=0, column=1, sticky="w")
+        ttk.Button(top, text="录制热键", command=self.capture_hotkey).grid(row=0, column=2, padx=3)
+        ttk.Button(top, text="保存配置", command=self.save_cfg).grid(row=0, column=3, padx=3)
+
+        tk.Label(top, text="局内等待(秒):").grid(row=1, column=0, sticky="e")
+        tk.Entry(top, textvariable=self.wait_var, width=10).grid(row=1, column=1, sticky="w")
+        tk.Checkbutton(top, text="自动循环", variable=self.auto_loop_var).grid(row=1, column=2, sticky="w")
+        tk.Label(top, text="循环次数(0=无限):").grid(row=1, column=3, sticky="e")
+        tk.Entry(top, textvariable=self.loop_count_var, width=8).grid(row=1, column=4, sticky="w")
+
+        toggle = tk.Frame(self.left_panel)
+        toggle.pack(fill="x", padx=10, pady=(0, 5))
+        tk.Checkbutton(
+            toggle,
+            text="开启无巧手解密",
+            variable=self.no_trick_var,
+            command=self._on_no_trick_toggle,
+        ).pack(anchor="w")
+
+        btns = tk.Frame(self.left_panel)
+        btns.pack(padx=10, pady=5)
+        ttk.Button(btns, text="开始执行", command=self.start_via_button).grid(row=0, column=0, padx=3)
+        ttk.Button(btns, text="开始监听热键", command=self.start_listen).grid(row=0, column=1, padx=3)
+        ttk.Button(btns, text="停止", command=self.stop_listen).grid(row=0, column=2, padx=3)
+        ttk.Button(btns, text="只执行一轮", command=self.run_once).grid(row=0, column=3, padx=3)
+
+        log_frame = tk.LabelFrame(self.left_panel, text="日志")
+        log_frame.pack(fill="both", expand=True, padx=10, pady=5)
+        self.log_text = tk.Text(log_frame, height=10)
+        self.log_text.pack(side="left", fill="both", expand=True)
+        sb = tk.Scrollbar(log_frame, command=self.log_text.yview)
+        sb.pack(side="right", fill="y")
+        self.log_text.config(yscrollcommand=sb.set)
+
+        status_frame = tk.LabelFrame(self.left_panel, text="执行状态")
+        status_frame.pack(fill="x", padx=10, pady=5)
+
+        ensure_goal_progress_style()
+        self.progress = ttk.Progressbar(
+            status_frame,
+            variable=self.progress_var,
+            maximum=100.0,
+            style="Goal.Horizontal.TProgressbar",
+        )
+        self.progress.pack(fill="x", padx=10, pady=(8, 4))
+
+        tk.Label(
+            status_frame,
+            textvariable=self.progress_message_var,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", padx=10, pady=(0, 2))
+
+        tk.Label(
+            status_frame,
+            textvariable=self.wait_message_var,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", padx=10, pady=(0, 2))
+
+        self.serum_preview_label = tk.Label(
+            status_frame,
+            relief="sunken",
+            bd=1,
+            bg="#f3f3f3",
+            height=6,
+            anchor="center",
+            text="等待识别 血清完成.png",
+        )
+        self.serum_preview_label.pack(fill="x", padx=10, pady=(6, 4))
+
+        tk.Label(
+            status_frame,
+            textvariable=self.serum_status_var,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", padx=10, pady=(0, 6))
+
+        self.no_trick_status_frame = tk.LabelFrame(self.right_panel, text="无巧手解密状态")
+        self.no_trick_status_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+        status_inner = tk.Frame(self.no_trick_status_frame)
+        status_inner.pack(fill="x", padx=5, pady=5)
+
+        tk.Label(
+            status_inner,
+            textvariable=self.no_trick_status_var,
+            anchor="w",
+            justify="left",
+        ).pack(fill="x", anchor="w")
+
+        self.no_trick_image_label = tk.Label(
+            self.no_trick_status_frame,
+            relief="sunken",
+            bd=1,
+            bg="#f8f8f8",
+        )
+        self.no_trick_image_label.pack(fill="both", expand=True, padx=10, pady=(0, 5))
+
+        self.no_trick_progress = ttk.Progressbar(
+            self.no_trick_status_frame,
+            variable=self.no_trick_progress_var,
+            maximum=100.0,
+            mode="determinate",
+        )
+        self.no_trick_progress.pack(fill="x", padx=10, pady=(0, 8))
+
+    # ---- 日志 & 状态 ----
+    def log(self, msg: str):
+        if self.log_text is None:
+            return
+        ts = time.strftime("[%H:%M:%S] ")
+        self.log_text.insert("end", ts + msg + "\n")
+        self.log_text.see("end")
+
+    def on_global_progress(self, p: float):
+        # 全局进度只用于主界面，这里忽略。
+        return
+
+    def set_progress(self, percent: float):
+        def _():
+            self.progress_var.set(max(0.0, min(100.0, percent)))
+        post_to_main_thread(_)
+
+    def set_status(self, text: str):
+        def _():
+            self.progress_message_var.set(text)
+        post_to_main_thread(_)
+
+    def set_wait_message(self, text: str):
+        def _():
+            self.wait_message_var.set(text)
+        post_to_main_thread(_)
+
+    def set_serum_status(self, text: str):
+        def _():
+            self.serum_status_var.set(text)
+        post_to_main_thread(_)
+
+    def show_serum_preview(self, photo, placeholder: str = "等待识别 血清完成.png"):
+        def _():
+            if self.serum_preview_label is None:
+                return
+            if photo is None:
+                self.serum_preview_label.config(image="", text=placeholder)
+            else:
+                self.serum_preview_label.config(image=photo, text="")
+            self.serum_image_ref = photo
+        post_to_main_thread(_)
+
+    def reset_round_ui(self):
+        self.set_progress(0.0)
+        self.set_status("等待开始")
+        self.set_wait_message("")
+        self.set_serum_status("尚未识别血清完成")
+        self.show_serum_preview(None)
+
+    # ---- 配置 / 热键 ----
+    def capture_hotkey(self):
+        if keyboard is None:
+            messagebox.showerror("错误", "未安装 keyboard，无法录制热键。")
+            return
+        log(f"{self.LOG_PREFIX} 请按下想要设置的热键组合…")
+
+        def worker():
+            try:
+                hk = keyboard.read_hotkey(suppress=False)
+                self.hotkey_var.set(hk)
+                log(f"{self.LOG_PREFIX} 捕获热键：{hk}")
+            except Exception as exc:
+                log(f"{self.LOG_PREFIX} 录制热键失败：{exc}")
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _parse_wait_seconds(self):
+        try:
+            value = float(self.wait_var.get().strip())
+            if value < 0:
+                raise ValueError
+            return value
+        except ValueError:
+            messagebox.showwarning("提示", "局内等待时间请输入不小于 0 的数字。")
+            return None
+
+    def _parse_loop_count(self):
+        text = self.loop_count_var.get().strip()
+        if not text:
+            return 0
+        try:
+            count = int(text)
+            if count < 0:
+                raise ValueError
+            return count
+        except ValueError:
+            messagebox.showwarning("提示", "循环次数请输入不小于 0 的整数。")
+            return None
+
+    def save_cfg(self):
+        wait_seconds = self._parse_wait_seconds()
+        if wait_seconds is None:
+            return
+        loop_count = self._parse_loop_count()
+        if loop_count is None:
+            return
+        section = self.cfg.setdefault("xp50_settings", {})
+        section["hotkey"] = self.hotkey_var.get().strip()
+        section["wait_seconds"] = wait_seconds
+        section["loop_count"] = loop_count
+        section["auto_loop"] = bool(self.auto_loop_var.get())
+        section["no_trick_decrypt"] = bool(self.no_trick_var.get())
+        save_config(self.cfg)
+        messagebox.showinfo("提示", "设置已保存。")
+
+    def ensure_assets(self) -> bool:
+        if pyautogui is None or cv2 is None or np is None:
+            messagebox.showerror("错误", "缺少 pyautogui 或 opencv/numpy，无法执行副本。")
+            return False
+        if keyboard is None:
+            messagebox.showerror("错误", "未安装 keyboard 模块，无法执行宏。")
+            return False
+        xp50_reset_asset_cache()
+        missing = []
+
+        start_path = xp50_find_asset(XP50_START_TEMPLATE, allow_templates=True)
+        if not start_path:
+            missing.append(
+                f"未找到 {XP50_START_TEMPLATE}，请放置于 {XP50_DIR} 或 templates 的任意子目录内"
+            )
+
+        serum_path = xp50_find_asset(XP50_SERUM_TEMPLATE)
+        if not serum_path:
+            missing.append(f"未找到 {XP50_SERUM_TEMPLATE}（期望位于 {XP50_DIR} 内）")
+
+        for name in XP50_MAP_TEMPLATES.values():
+            path = xp50_find_asset(name)
+            if not path:
+                missing.append(f"未找到 {name}（请放置在 {XP50_DIR} 目录或其子目录）")
+        for files in XP50_MACRO_SEQUENCE.values():
+            for fname in files:
+                path = xp50_find_asset(fname)
+                if not path:
+                    missing.append(f"未找到 {fname}（请放置在 {XP50_DIR} 目录或其子目录）")
+        if missing:
+            msg = "\n".join(missing)
+            messagebox.showerror("错误", f"以下文件缺失：\n{msg}")
+            return False
+        return True
+
+    # ---- 控制 ----
+    def start_via_button(self):
+        """手动点击开始执行时进入主循环。"""
+
+        self.start_worker(auto_loop=self.auto_loop_var.get())
+
+    def start_listen(self):
+        if keyboard is None:
+            messagebox.showerror("错误", "未安装 keyboard，无法使用热键监听。")
+            return
+        if not self.ensure_assets():
+            return
+        hk = self.hotkey_var.get().strip()
+        if not hk:
+            messagebox.showwarning("提示", "请先设置一个热键。")
+            return
+
+        worker_stop.clear()
+        if self.hotkey_handle is not None:
+            try:
+                keyboard.remove_hotkey(self.hotkey_handle)
+            except Exception:
+                pass
+            self.hotkey_handle = None
+
+        def on_hotkey():
+            log(f"{self.LOG_PREFIX} 检测到热键，开始执行一轮。")
+            self.start_worker(auto_loop=self.auto_loop_var.get())
+
+        try:
+            self.hotkey_handle = keyboard.add_hotkey(hk, on_hotkey)
+        except Exception as exc:
+            messagebox.showerror("错误", f"注册热键失败：{exc}")
+            return
+        log(f"{self.LOG_PREFIX} 开始监听热键：{hk}")
+
+    def stop_listen(self):
+        worker_stop.set()
+        if keyboard is not None and self.hotkey_handle is not None:
+            try:
+                keyboard.remove_hotkey(self.hotkey_handle)
+            except Exception:
+                pass
+        self.hotkey_handle = None
+        log(f"{self.LOG_PREFIX} 已停止监听，当前轮结束后退出。")
+
+    def start_worker(self, auto_loop: bool = None, loop_override: int = None):
+        if not self.ensure_assets():
+            return
+        wait_seconds = self._parse_wait_seconds()
+        if wait_seconds is None:
+            return
+        loop_count = self._parse_loop_count()
+        if loop_count is None:
+            return
+        if loop_override is not None:
+            loop_count = loop_override
+        if auto_loop is None:
+            auto_loop = self.auto_loop_var.get()
+        if not auto_loop:
+            loop_count = max(1, loop_override or 1)
+
+        if not round_running_lock.acquire(blocking=False):
+            messagebox.showwarning("提示", "当前已有其它任务在运行，请先停止后再试。")
+            return
+
+        worker_stop.clear()
+        self.running = True
+        self.reset_round_ui()
+        self.set_status("准备开始…")
+
+        def worker():
+            try:
+                self._worker_loop(wait_seconds, auto_loop, loop_count)
+            finally:
+                self.running = False
+                round_running_lock.release()
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def run_once(self):
+        self.start_worker(auto_loop=False, loop_override=1)
+
+    def _worker_loop(self, wait_seconds: float, auto_loop: bool, loop_limit: int):
+        loops_done = 0
+        try:
+            while not worker_stop.is_set():
+                loops_done += 1
+                log(f"===== {self.LOG_PREFIX} 新一轮开始 =====")
+                success = self._run_round(wait_seconds)
+                if worker_stop.is_set():
+                    break
+                if not auto_loop:
+                    break
+                if loop_limit > 0 and loops_done >= loop_limit:
+                    log(f"{self.LOG_PREFIX} 达到循环次数限制，结束执行。")
+                    break
+                if not success:
+                    log(f"{self.LOG_PREFIX} 本轮未完成，重新开始下一轮。")
+                else:
+                    log(f"{self.LOG_PREFIX} 本轮完成，{self.BETWEEN_ROUNDS_DELAY:.0f} 秒后继续。")
+                self.set_status("等待下一轮开始…")
+                self.set_wait_message("")
+                delay = self.BETWEEN_ROUNDS_DELAY
+                step = 0.1
+                while delay > 0 and not worker_stop.is_set():
+                    time.sleep(min(step, delay))
+                    delay -= step
+        except Exception as exc:
+            log(f"{self.LOG_PREFIX} 后台线程异常：{exc}")
+            traceback.print_exc()
+        finally:
+            self.on_worker_finished()
+
+    def on_worker_finished(self):
+        self._stop_no_trick_monitor()
+
+        def _():
+            self.progress_var.set(0.0)
+            if not worker_stop.is_set():
+                self.progress_message_var.set("就绪")
+            if self.hotkey_handle is None:
+                self.set_wait_message("")
+        post_to_main_thread(_)
+
+    # ---- 核心逻辑 ----
+    def _run_round(self, wait_seconds: float) -> bool:
+        if worker_stop.is_set():
+            return False
+
+        if not init_game_region():
+            log(f"{self.LOG_PREFIX} 初始化游戏区域失败，本轮结束。")
+            self.set_status("初始化失败")
+            return False
+
+        self.set_status("点击开始挑战（第一次）…")
+        if not xp50_wait_and_click(
+            XP50_START_TEMPLATE,
+            f"{self.LOG_PREFIX} 进入：开始挑战（第一次）",
+            25.0,
+            XP50_CLICK_THRESHOLD,
+        ):
+            self.set_status("未能点击开始挑战。")
+            return False
+        self.set_progress(5.0)
+        time.sleep(0.5)
+        if worker_stop.is_set():
+            return False
+
+        self.set_status("点击开始挑战（第二次）…")
+        if not xp50_wait_and_click(
+            XP50_START_TEMPLATE,
+            f"{self.LOG_PREFIX} 进入：开始挑战（第二次）",
+            20.0,
+            XP50_CLICK_THRESHOLD,
+        ):
+            self.set_status("第二次点击开始挑战失败。")
+            return False
+        self.set_progress(10.0)
+        time.sleep(0.5)
+        if worker_stop.is_set():
+            return False
+
+        chosen = None
+        scores = {label: 0.0 for label in XP50_MAP_TEMPLATES}
+        map_paths = {}
+        for label, tpl_name in XP50_MAP_TEMPLATES.items():
+            path = xp50_find_asset(tpl_name)
+            if not path:
+                log(f"{self.LOG_PREFIX} 缺少地图模板：{tpl_name}")
+                self.set_status("地图模板缺失")
+                return False
+            map_paths[label] = path
+        self.set_status("识别地图模板…")
+        deadline = time.time() + 12.0
+        while time.time() < deadline and not worker_stop.is_set():
+            for label, tpl_name in XP50_MAP_TEMPLATES.items():
+                path = map_paths[label]
+                score, _, _ = match_template_from_path(path)
+                scores[label] = score
+            log(
+                f"{self.LOG_PREFIX} 地图匹配："
+                f"mapa={scores['A']:.3f}，mapb={scores['B']:.3f}"
+            )
+            best_label = max(scores, key=scores.get)
+            best_score = scores[best_label]
+            if best_score >= XP50_MAP_THRESHOLD:
+                chosen = best_label
+                break
+            time.sleep(0.4)
+
+        if worker_stop.is_set():
+            return False
+
+        if chosen is None:
+            log(f"{self.LOG_PREFIX} 地图识别失败，匹配度始终低于 {XP50_MAP_THRESHOLD:.2f}。")
+            self.set_status("地图识别失败")
+            return False
+
+        map_label = f"map{chosen.lower()}"
+        self.set_status(f"识别为 {map_label}，等待画面稳定…")
+        self.set_progress(20.0)
+
+        t0 = time.time()
+        while time.time() - t0 < self.MAP_STABILIZE_DELAY and not worker_stop.is_set():
+            time.sleep(0.1)
+
+        if worker_stop.is_set():
+            return False
+
+        macros = XP50_MACRO_SEQUENCE.get(chosen, [])
+        if len(macros) < 3:
+            log(f"{self.LOG_PREFIX} {map_label} 的宏文件数量不足。")
+            self.set_status("宏文件缺失")
+            return False
+
+        resolved_macros = []
+        for macro_name in macros:
+            macro_path = xp50_find_asset(macro_name)
+            if not macro_path:
+                log(f"{self.LOG_PREFIX} 缺少宏文件：{macro_name}")
+                self.set_status("宏文件缺失")
+                return False
+            resolved_macros.append((macro_name, macro_path))
+
+        for idx, (macro_name, macro_path) in enumerate(resolved_macros):
+            segment = self.PROGRESS_SEGMENTS[min(idx, len(self.PROGRESS_SEGMENTS) - 1)]
+            self.set_status(f"执行 {macro_name}…")
+            executed = self._run_map_macro(macro_path, macro_name, *segment)
+            if worker_stop.is_set():
+                return False
+            if not executed:
+                self.set_status(f"执行 {macro_name} 失败")
+                return False
+
+            if idx == 1:
+                self.set_progress(segment[1])
+                success = self._wait_for_serum(wait_seconds)
+                if worker_stop.is_set():
+                    return False
+                if not success:
+                    log(f"{self.LOG_PREFIX} 等待血清完成超时，执行防卡死。")
+                    self._on_serum_timeout()
+                    emergency_recover()
+                    return False
+
+        self.set_status("执行撤离宏完成。")
+        self.set_wait_message("")
+        self.set_serum_status("撤离完成，等待下一轮。")
+        self.set_progress(100.0)
+        return True
+
+    def _run_map_macro(self, macro_path: str, macro_name: str, start: float, end: float) -> bool:
+        if not os.path.exists(macro_path):
+            log(f"{self.LOG_PREFIX} 缺少宏文件：{macro_path}")
+            return False
+
+        controller = self._start_no_trick_monitor()
+
+        def progress_cb(local):
+            span = max(0.0, end - start)
+            percent = start + span * max(0.0, min(1.0, local))
+            self.set_progress(percent)
+
+        try:
+            executed = play_macro(
+                macro_path,
+                f"{self.LOG_PREFIX} {macro_name}",
+                0.0,
+                0.0,
+                interrupt_on_exit=False,
+                interrupter=controller,
+                progress_callback=progress_cb,
+            )
+        finally:
+            if controller is not None:
+                controller.stop()
+                controller.finish_session()
+                if self.no_trick_controller is controller:
+                    self.no_trick_controller = None
+
+        if executed:
+            self.set_progress(end)
+        return bool(executed)
+
+    def _wait_for_serum(self, wait_seconds: float) -> bool:
+        template_path = xp50_find_asset(XP50_SERUM_TEMPLATE)
+        if not template_path:
+            log(f"{self.LOG_PREFIX} 缺少血清完成模板：{XP50_SERUM_TEMPLATE}")
+            return False
+        total = max(0.0, float(wait_seconds or 0.0))
+        start_time = time.time()
+
+        self.set_wait_message(
+            "等待血清完成…" if total <= 0 else f"等待血清完成（剩余 {total:.1f} 秒）"
+        )
+        self.set_serum_status("尚未识别血清完成")
+        self.show_serum_preview(None)
+
+        while not worker_stop.is_set():
+            elapsed = time.time() - start_time
+            remaining = max(total - elapsed, 0.0)
+            if total > 0:
+                fraction = min(1.0, elapsed / total)
+            else:
+                fraction = 0.0
+            self._update_wait_progress(fraction, remaining if total > 0 else None)
+
+            score, _, _ = match_template_from_path(template_path)
+            if score >= XP50_SERUM_THRESHOLD:
+                self._on_serum_detected(template_path)
+                return True
+
+            if total > 0 and elapsed >= total:
+                break
+            time.sleep(self.WAIT_POLL_INTERVAL)
+
+        return False
+
+    def _update_wait_progress(self, fraction: float, remaining):
+        start, end = self.WAIT_PROGRESS_RANGE
+        percent = start + (end - start) * max(0.0, min(1.0, fraction))
+
+        def _():
+            self.progress_var.set(max(0.0, min(100.0, percent)))
+            if remaining is None:
+                self.wait_message_var.set("等待血清完成…")
+            else:
+                self.wait_message_var.set(f"等待血清完成（剩余 {remaining:.1f} 秒）")
+
+        post_to_main_thread(_)
+
+    def _on_serum_detected(self, template_path: str):
+        self.set_progress(self.WAIT_PROGRESS_RANGE[1])
+        self.set_wait_message("识别到血清完成，开始撤退。")
+        self.set_serum_status("识别到血清完成，准备执行撤离宏。")
+        photo = self._load_serum_preview(template_path)
+        self.show_serum_preview(photo, placeholder="识别到血清完成")
+
+    def _on_serum_timeout(self):
+        self.set_wait_message("等待血清完成超时。")
+        self.set_serum_status("超时未识别血清完成，已执行防卡死。")
+
+    def _load_serum_preview(self, path: str, max_size: int = 280):
+        if not path or not os.path.exists(path):
+            return None
+        if Image is not None and ImageTk is not None:
+            try:
+                with Image.open(path) as pil_img:
+                    pil_img = pil_img.convert("RGBA")
+                    w, h = pil_img.size
+                    scale = 1.0
+                    if max(w, h) > max_size:
+                        scale = max_size / max(w, h)
+                        pil_img = pil_img.resize(
+                            (
+                                max(1, int(w * scale)),
+                                max(1, int(h * scale)),
+                            ),
+                            Image.LANCZOS,
+                        )
+                    return ImageTk.PhotoImage(pil_img)
+            except Exception:
+                pass
+        try:
+            img = tk.PhotoImage(file=path)
+        except Exception:
+            return None
+        w = max(img.width(), 1)
+        h = max(img.height(), 1)
+        factor = max(1, (max(w, h) + max_size - 1) // max_size)
+        if factor > 1:
+            img = img.subsample(factor, factor)
+        return img
+
+    # ---- 无巧手解密 ----
+    def _on_no_trick_toggle(self):
+        if not self.no_trick_var.get():
+            self._stop_no_trick_monitor()
+        self._update_no_trick_ui()
+
+    def _update_no_trick_ui(self):
+        if self.no_trick_var.get():
+            self._ensure_no_trick_frame_visible()
+            if self.no_trick_controller is None:
+                self._set_no_trick_status_direct("等待识别解密图像…")
+                self._set_no_trick_progress_value(0.0)
+                self._set_no_trick_image(None)
+        else:
+            self._hide_no_trick_frame()
+            self._set_no_trick_status_direct("未启用")
+            self._set_no_trick_progress_value(0.0)
+            self._set_no_trick_image(None)
+
+    def _ensure_no_trick_frame_visible(self):
+        if self.no_trick_status_frame is None:
+            return
+        if not self.no_trick_status_frame.winfo_ismapped():
+            self.no_trick_status_frame.pack(fill="both", expand=True, padx=5, pady=5)
+
+    def _hide_no_trick_frame(self):
+        if self.no_trick_status_frame is None:
+            return
+        if self.no_trick_status_frame.winfo_manager():
+            self.no_trick_status_frame.pack_forget()
+
+    def _set_no_trick_status_direct(self, text: str):
+        self.no_trick_status_var.set(text)
+
+    def _set_no_trick_progress_value(self, percent: float):
+        self.no_trick_progress_var.set(max(0.0, min(100.0, percent)))
+
+    def _set_no_trick_image(self, photo):
+        if self.no_trick_image_label is None:
+            return
+        if photo is None:
+            self.no_trick_image_label.config(image="")
+        else:
+            self.no_trick_image_label.config(image=photo)
+        self.no_trick_image_ref = photo
+
+    def _load_no_trick_preview(self, path: str, max_size: int = 240):
+        if not path or not os.path.exists(path):
+            return None
+        if Image is not None and ImageTk is not None:
+            try:
+                with Image.open(path) as pil_img:
+                    pil_img = pil_img.convert("RGBA")
+                    w, h = pil_img.size
+                    scale = 1.0
+                    if max(w, h) > max_size:
+                        scale = max_size / max(w, h)
+                        pil_img = pil_img.resize(
+                            (
+                                max(1, int(w * scale)),
+                                max(1, int(h * scale)),
+                            ),
+                            Image.LANCZOS,
+                        )
+                    return ImageTk.PhotoImage(pil_img)
+            except Exception:
+                pass
+        try:
+            img = tk.PhotoImage(file=path)
+        except Exception:
+            return None
+        w = max(img.width(), 1)
+        h = max(img.height(), 1)
+        factor = max(1, (max(w, h) + max_size - 1) // max_size)
+        if factor > 1:
+            img = img.subsample(factor, factor)
+        return img
+
+    def _start_no_trick_monitor(self):
+        if not self.no_trick_var.get():
+            return None
+        controller = NoTrickDecryptController(self, GAME_DIR)
+        if controller.start():
+            self.no_trick_controller = controller
+            return controller
+        return None
+
+    def _stop_no_trick_monitor(self):
+        controller = self.no_trick_controller
+        if controller is not None:
+            controller.stop()
+            controller.finish_session()
+            self.no_trick_controller = None
+
+    def on_no_trick_unavailable(self, reason: str):
+        def _():
+            if not self.no_trick_var.get():
+                return
+            self._ensure_no_trick_frame_visible()
+            self._set_no_trick_status_direct(f"无巧手解密不可用：{reason}。")
+            self._set_no_trick_progress_value(0.0)
+            self._set_no_trick_image(None)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_no_templates(self, game_dir: str):
+        def _():
+            if not self.no_trick_var.get():
+                return
+            self._ensure_no_trick_frame_visible()
+            self._set_no_trick_status_direct("Game 文件夹中未找到解密图像模板，请放置 1.png 等文件。")
+            self._set_no_trick_progress_value(0.0)
+            self._set_no_trick_image(None)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_monitor_started(self, templates):
+        total = len(templates)
+        valid = sum(1 for t in templates if t.get("template") is not None)
+
+        def _():
+            if not self.no_trick_var.get():
+                return
+            self._ensure_no_trick_frame_visible()
+            if valid <= 0:
+                self._set_no_trick_status_direct("Game 模板加载失败，无法识别解密图像。")
+            else:
+                self._set_no_trick_status_direct(f"等待识别解密图像（共 {total} 张模板）…")
+            self._set_no_trick_progress_value(0.0)
+            self._set_no_trick_image(None)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_detected(self, entry, score: float):
+        def _():
+            if not self.no_trick_var.get():
+                return
+            self._ensure_no_trick_frame_visible()
+            name = entry.get("name", "")
+            self._set_no_trick_status_direct(f"识别到解密图像 - {name}，正在解密…")
+            photo = self._load_no_trick_preview(entry.get("png_path"))
+            self._set_no_trick_image(photo)
+            self._set_no_trick_progress_value(0.0)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_macro_start(self, entry, score: float):
+        def _():
+            if not self.no_trick_var.get():
+                return
+            self._set_no_trick_progress_value(0.0)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_progress(self, progress: float):
+        def _():
+            if not self.no_trick_var.get():
+                return
+            self._set_no_trick_progress_value(progress * 100.0)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_macro_complete(self, entry):
+        def _():
+            if not self.no_trick_var.get():
+                return
+            self._set_no_trick_status_direct("解密完成，恢复原宏执行。")
+            self._set_no_trick_progress_value(100.0)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_macro_missing(self, entry):
+        def _():
+            if not self.no_trick_var.get():
+                return
+            base = os.path.splitext(entry.get("name", ""))[0]
+            self._set_no_trick_status_direct(f"未找到 {base}.json，跳过无巧手解密。")
+            self._set_no_trick_progress_value(0.0)
+            self._set_no_trick_image(None)
+
+        post_to_main_thread(_)
+
+    def on_no_trick_session_finished(self, triggered: bool, macro_executed: bool, macro_missing: bool):
+        def _():
+            if not self.no_trick_var.get():
+                return
+            if not triggered:
+                self._set_no_trick_status_direct("本轮未识别到解密图像。")
+                self._set_no_trick_progress_value(0.0)
+                self._set_no_trick_image(None)
+            elif macro_executed:
+                self._set_no_trick_status_direct("解密流程完成，继续执行原宏。")
+                self._set_no_trick_progress_value(100.0)
+
+        post_to_main_thread(_)
+
+# ======================================================================
 #  main
 # ======================================================================
 def main():
-    global app, uid_mask_manager
+    global app, uid_mask_manager, xp50_app
     cfg = load_config()
 
     root = tk.Tk()
@@ -3451,6 +5665,11 @@ def main():
     frame_firework = ttk.Frame(notebook)
     notebook.add(frame_firework, text="赛琪大烟花")
     app = MainGUI(frame_firework, cfg)
+
+    frame_xp50 = ttk.Frame(notebook)
+    notebook.add(frame_xp50, text="全自动50人物经验副本")
+    xp50_gui = XP50AutoGUI(frame_xp50, cfg)
+    xp50_app = xp50_gui
 
     frame_fragment = ttk.Frame(notebook)
     notebook.add(frame_fragment, text="人物碎片刷取")
