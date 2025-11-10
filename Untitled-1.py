@@ -219,6 +219,21 @@ hotkey_handle = None
 app = None             # 赛琪大烟花 GUI 实例
 xp50_app = None        # 50 经验副本 GUI 实例
 fragment_apps = []     # 人物碎片 GUI 实例列表
+
+# 手动常驻解密日志抑制
+log_context = threading.local()
+
+# 独立无巧手解密（常驻）控制
+manual_firework_service = None
+manual_line_service = None
+manual_firework_var = None
+manual_line_var = None
+manual_collapse_active = False
+manual_original_geometry = None
+manual_expand_button = None
+root_window = None
+toolbar_frame = None
+manual_previous_minsize = None
 uid_mask_manager = None
 
 tk_call_queue = queue.Queue()
@@ -303,6 +318,8 @@ def register_fragment_app(gui):
 
 
 def log(msg: str):
+    if getattr(log_context, "suppress", False):
+        return
     ts = time.strftime("[%H:%M:%S] ")
     print(ts + msg)
     if app is not None:
@@ -399,6 +416,130 @@ class CollapsibleLogPanel(tk.Frame):
 
     def clear(self):
         self.text.delete("1.0", "end")
+
+class StandaloneNoTrickStub:
+    """Minimal GUI stub used by 常驻无巧手解密服务."""
+
+    def __init__(self, log_prefix: str):
+        self.log_prefix = log_prefix
+        self.suppress_log = True
+        self._finished = threading.Event()
+
+    def reset(self):
+        self._finished.clear()
+
+    def on_no_trick_unavailable(self, reason: str):
+        pass
+
+    def on_no_trick_no_templates(self, game_dir: str):
+        pass
+
+    def on_no_trick_monitor_started(self, templates):
+        pass
+
+    def on_no_trick_detected(self, entry, score: float):
+        pass
+
+    def on_no_trick_macro_start(self, entry, score: float):
+        pass
+
+    def on_no_trick_progress(self, progress: float):
+        pass
+
+    def on_no_trick_macro_complete(self, entry):
+        pass
+
+    def on_no_trick_macro_missing(self, entry):
+        pass
+
+    def on_no_trick_session_finished(self, triggered: bool, macro_executed: bool, macro_missing: bool):
+        self._finished.set()
+
+    def on_no_trick_idle(self, remaining: float):
+        pass
+
+    def on_no_trick_idle_complete(self):
+        pass
+
+    @property
+    def finished_event(self):
+        return self._finished
+
+
+class StandaloneDecryptService:
+    """Run a decrypt controller in the background until explicitly stopped."""
+
+    def __init__(self, controller_cls, game_dir: str, log_prefix: str):
+        self.controller_cls = controller_cls
+        self.game_dir = game_dir
+        self.log_prefix = log_prefix
+        self._thread = None
+        self._stop_event = threading.Event()
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread and self._thread.is_alive():
+            try:
+                self._thread.join(timeout=1.5)
+            except Exception:
+                pass
+        self._thread = None
+
+    def _run(self):
+        log_context.suppress = True
+        try:
+            while not self._stop_event.is_set():
+                stub = StandaloneNoTrickStub(self.log_prefix)
+                stub.reset()
+                controller = self.controller_cls(stub, self.game_dir)
+                try:
+                    if not controller.start():
+                        controller.stop()
+                        controller.finish_session()
+                        if self._stop_event.wait(3.0):
+                            break
+                        continue
+                except Exception:
+                    if self._stop_event.wait(3.0):
+                        break
+                    continue
+
+                keyboard_state = KeyboardPlaybackState()
+
+                try:
+                    while not self._stop_event.is_set() and controller.session_started:
+                        pause = controller.run_decrypt_if_needed(keyboard_state)
+                        if pause and pause > 0:
+                            time.sleep(min(0.05, pause))
+                        else:
+                            time.sleep(0.05)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        controller.stop()
+                    except Exception:
+                        pass
+                    try:
+                        controller.finish_session()
+                    except Exception:
+                        pass
+
+                if self._stop_event.wait(0.2):
+                    break
+        finally:
+            try:
+                log_context.suppress = False
+            except Exception:
+                pass
+
 
 def load_preview_image(path: str, max_size: int = 72):
     if not path or not os.path.exists(path):
@@ -1696,9 +1837,14 @@ class NoTrickDecryptController:
         self.thread = None
         self.session_started = False
 
+    def _log(self, message: str):
+        if getattr(self.gui, "suppress_log", False):
+            return
+        log(message)
+
     def start(self) -> bool:
         if cv2 is None or np is None:
-            log("缺少 opencv/numpy，无法开启无巧手解密监控。")
+            self._log("缺少 opencv/numpy，无法开启无巧手解密监控。")
             try:
                 self.gui.on_no_trick_unavailable("缺少 opencv/numpy")
             except Exception:
@@ -1755,7 +1901,7 @@ class NoTrickDecryptController:
 
         macro_path = entry.get("json_path")
         if not macro_path or not os.path.exists(macro_path):
-            log(f"{self.gui.log_prefix} 无巧手解密：缺少对应宏文件 {macro_path}")
+            self._log(f"{self.gui.log_prefix} 无巧手解密：缺少对应宏文件 {macro_path}")
             self.macro_missing = True
             self.gui.on_no_trick_macro_missing(entry)
             return 0.0
@@ -1766,7 +1912,7 @@ class NoTrickDecryptController:
 
         base_name = entry.get("base_name") or os.path.splitext(entry.get("name", ""))[0]
         macro_label = f"{self.gui.log_prefix} 无巧手解密 {base_name}.json"
-        log(f"{self.gui.log_prefix} 无巧手解密：回放 {base_name}.json 宏。")
+        self._log(f"{self.gui.log_prefix} 无巧手解密：回放 {base_name}.json 宏。")
 
         start = time.perf_counter()
         self.gui.on_no_trick_macro_start(entry, score)
@@ -1822,7 +1968,7 @@ class NoTrickDecryptController:
             try:
                 img = screenshot_game()
             except Exception as e:
-                log(f"无巧手解密：截图失败 {e}")
+                self._log(f"无巧手解密：截图失败 {e}")
                 time.sleep(self.CHECK_INTERVAL)
                 continue
 
@@ -1835,7 +1981,7 @@ class NoTrickDecryptController:
                     res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, _ = cv2.minMaxLoc(res)
                 except Exception as e:
-                    log(f"无巧手解密：匹配 {entry.get('name')} 失败：{e}")
+                    self._log(f"无巧手解密：匹配 {entry.get('name')} 失败：{e}")
                     continue
                 if max_val >= self.MATCH_THRESHOLD:
                     with self.trigger_lock:
@@ -1858,7 +2004,7 @@ class NoTrickDecryptController:
                 if f.lower().endswith(".png")
             ]
         except Exception as e:
-            log(f"读取 Game 目录失败：{e}")
+            self._log(f"读取 Game 目录失败：{e}")
             return templates
 
         def sort_key(name):
@@ -1877,7 +2023,7 @@ class NoTrickDecryptController:
                 data = np.fromfile(png_path, dtype=np.uint8)
                 tpl = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
             except Exception as e:
-                log(f"无巧手解密：读取模板 {png_path} 失败：{e}")
+                self._log(f"无巧手解密：读取模板 {png_path} 失败：{e}")
                 tpl = None
             templates.append(
                 {
@@ -1917,9 +2063,14 @@ class FireworkNoTrickController:
         self.active = False
         self.thread = None
 
+    def _log(self, message: str):
+        if getattr(self.gui, "suppress_log", False):
+            return
+        log(message)
+
     def start(self) -> bool:
         if cv2 is None or np is None:
-            log("缺少 opencv/numpy，无法开启无巧手解密监控。")
+            self._log("缺少 opencv/numpy，无法开启无巧手解密监控。")
             try:
                 self.gui.on_no_trick_unavailable("缺少 opencv/numpy")
             except Exception:
@@ -2044,7 +2195,7 @@ class FireworkNoTrickController:
             restore_keys = keyboard_state.suspend()
 
         macro_label = f"赛琪无巧手解密 {base_name}.json"
-        log(f"赛琪无巧手解密：回放 {base_name}.json 宏。")
+        self._log(f"赛琪无巧手解密：回放 {base_name}.json 宏。")
 
         try:
             self.gui.on_no_trick_macro_start(entry, score)
@@ -2099,14 +2250,14 @@ class FireworkNoTrickController:
             try:
                 img = screenshot_game()
             except Exception as e:
-                log(f"赛琪无巧手解密：截图失败 {e}")
+                self._log(f"赛琪无巧手解密：截图失败 {e}")
                 time.sleep(self.CHECK_INTERVAL)
                 continue
 
             try:
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
             except Exception as e:
-                log(f"赛琪无巧手解密：转灰度失败 {e}")
+                self._log(f"赛琪无巧手解密：转灰度失败 {e}")
                 time.sleep(self.CHECK_INTERVAL)
                 continue
 
@@ -2119,7 +2270,7 @@ class FireworkNoTrickController:
                     res = cv2.matchTemplate(gray, tpl, cv2.TM_CCOEFF_NORMED)
                     _, max_val, _, _ = cv2.minMaxLoc(res)
                 except Exception as e:
-                    log(f"赛琪无巧手解密：匹配 {entry.get('name')} 失败：{e}")
+                    self._log(f"赛琪无巧手解密：匹配 {entry.get('name')} 失败：{e}")
                     continue
                 if max_val >= self.MATCH_THRESHOLD:
                     self._queue_detection(entry, max_val)
@@ -2162,7 +2313,7 @@ class FireworkNoTrickController:
                 if f.lower().endswith(".png")
             ]
         except Exception as e:
-            log(f"读取 {self.game_dir} 目录失败：{e}")
+            self._log(f"读取 {self.game_dir} 目录失败：{e}")
             return templates
 
         for name in sorted(candidates):
@@ -2173,7 +2324,7 @@ class FireworkNoTrickController:
                 data = np.fromfile(png_path, dtype=np.uint8)
                 tpl = cv2.imdecode(data, cv2.IMREAD_GRAYSCALE)
             except Exception as e:
-                log(f"赛琪无巧手解密：读取模板 {png_path} 失败：{e}")
+                self._log(f"赛琪无巧手解密：读取模板 {png_path} 失败：{e}")
                 tpl = None
             templates.append(
                 {
@@ -2207,10 +2358,10 @@ class FireworkNoTrickController:
 def do_enter_buttons_first_round() -> bool:
     """第一轮需要 enter_step1 / enter_step2"""
     if not wait_and_click_template("enter_step1.png", "进入 步骤1", 20.0, 0.85):
-        log("进入 步骤1 失败，本轮放弃。")
+        self._log("进入 步骤1 失败，本轮放弃。")
         return False
     if not wait_and_click_template("enter_step2.png", "进入 步骤2", 15.0, 0.85):
-        log("进入 步骤2 失败，本轮放弃。")
+        self._log("进入 步骤2 失败，本轮放弃。")
         return False
     return True
 
@@ -2218,7 +2369,7 @@ def do_enter_buttons_first_round() -> bool:
 def check_map_by_map1() -> bool:
     """只看 map1，阈值沿用 0.5"""
     if not wait_for_template("map1.png", "地图确认（map1）", 30.0, 0.5):
-        log("地图匹配失败（map1 匹配度始终低于 0.5），本轮放弃。")
+        self._log("地图匹配失败（map1 匹配度始终低于 0.5），本轮放弃。")
         return False
     return True
 
@@ -2229,14 +2380,14 @@ def do_exit_dungeon():
 
 
 def emergency_recover():
-    log("执行防卡死退图：ESC → G → Q → 退图")
+    self._log("执行防卡死退图：ESC → G → Q → 退图")
     try:
         if keyboard is not None:
             keyboard.press_and_release("esc")
         else:
             pyautogui.press("esc")
     except Exception as e:
-        log(f"发送 ESC 失败：{e}")
+        self._log(f"发送 ESC 失败：{e}")
     time.sleep(1.0)
     click_template("G.png", "点击 G.png", 0.6)
     time.sleep(1.0)
@@ -2250,11 +2401,11 @@ def run_one_round(wait_interval: float,
                   macro_b: str,
                   skip_enter_buttons: bool,
                   gui=None):
-    log("===== 赛琪大烟花：新一轮开始 =====")
+    self._log("===== 赛琪大烟花：新一轮开始 =====")
     report_progress(0.0)
 
     if not init_game_region():
-        log("初始化游戏区域失败，本轮结束。")
+        self._log("初始化游戏区域失败，本轮结束。")
         return
 
     if not skip_enter_buttons:
@@ -2264,7 +2415,7 @@ def run_one_round(wait_interval: float,
     if not check_map_by_map1():
         return
 
-    log("地图确认成功，等待 2 秒让画面稳定…")
+    self._log("地图确认成功，等待 2 秒让画面稳定…")
     t0 = time.time()
     while time.time() - t0 < 2.0 and not worker_stop.is_set():
         time.sleep(0.1)
@@ -2287,7 +2438,7 @@ def run_one_round(wait_interval: float,
             controller.finish_session()
             gui._clear_firework_no_trick_controller(controller)
             if stuck:
-                log("赛琪无巧手解密：连续解密失败，执行防卡死流程。")
+                self._log("赛琪无巧手解密：连续解密失败，执行防卡死流程。")
                 emergency_recover()
                 return
             controller = None
@@ -2295,7 +2446,7 @@ def run_one_round(wait_interval: float,
         return
 
     if wait_interval > 0:
-        log(f"等待大烟花爆炸 {wait_interval:.1f} 秒…")
+        self._log(f"等待大烟花爆炸 {wait_interval:.1f} 秒…")
         t0 = time.time()
         while time.time() - t0 < wait_interval and not worker_stop.is_set():
             time.sleep(0.1)
@@ -2305,13 +2456,13 @@ def run_one_round(wait_interval: float,
         return
 
     if is_exit_ui_visible():
-        log("检测到退图按钮，执行正常退图。")
+        self._log("检测到退图按钮，执行正常退图。")
         do_exit_dungeon()
     else:
         emergency_recover()
 
     report_progress(1.0)
-    log("赛琪大烟花：本轮完成。")
+    self._log("赛琪大烟花：本轮完成。")
 
 
 def worker_loop(wait_interval: float,
@@ -2324,19 +2475,19 @@ def worker_loop(wait_interval: float,
         while not worker_stop.is_set():
             skip_enter = (auto_loop and not first_round)
             if skip_enter:
-                log("自动循环：本轮跳过 enter_step1/2，只从地图确认(map1)开始。")
+                self._log("自动循环：本轮跳过 enter_step1/2，只从地图确认(map1)开始。")
             run_one_round(wait_interval, macro_a, macro_b, skip_enter, gui=gui)
             first_round = False
             if worker_stop.is_set() or not auto_loop:
                 break
-            log("本轮结束，3 秒后继续下一轮…")
+            self._log("本轮结束，3 秒后继续下一轮…")
             time.sleep(3.0)
     except Exception as e:
-        log(f"后台线程异常：{e}")
+        self._log(f"后台线程异常：{e}")
         traceback.print_exc()
     finally:
         report_progress(0.0)
-        log("后台线程结束。")
+        self._log("后台线程结束。")
 
 
 # ---------- GUI：赛琪大烟花 ----------
@@ -6530,14 +6681,176 @@ class XP50AutoGUI:
 # ======================================================================
 #  main
 # ======================================================================
+def ensure_manual_firework_service():
+    global manual_firework_service
+    if manual_firework_service is None:
+        manual_firework_service = StandaloneDecryptService(
+            FireworkNoTrickController,
+            GAME_SQ_DIR,
+            "赛琪无巧手解密",
+        )
+    return manual_firework_service
+
+
+def ensure_manual_line_service():
+    global manual_line_service
+    if manual_line_service is None:
+        manual_line_service = StandaloneDecryptService(
+            NoTrickDecryptController,
+            GAME_DIR,
+            "无巧手解密",
+        )
+    return manual_line_service
+
+
+def set_firework_no_trick_enabled(enabled: bool):
+    if app is None:
+        return
+    var = getattr(app, "no_trick_var", None)
+    if var is None:
+        return
+    try:
+        current = bool(var.get())
+    except Exception:
+        current = None
+    if current == enabled:
+        return
+    try:
+        var.set(enabled)
+    except Exception:
+        return
+    handler = getattr(app, "_on_no_trick_toggle", None)
+    if callable(handler):
+        try:
+            handler()
+        except Exception:
+            pass
+
+
+def set_line_no_trick_enabled(enabled: bool):
+    targets = []
+    if xp50_app is not None:
+        targets.append(xp50_app)
+    targets.extend(fragment_apps)
+    for gui in targets:
+        var = getattr(gui, "no_trick_var", None)
+        if var is None:
+            continue
+        try:
+            current = bool(var.get())
+        except Exception:
+            current = None
+        if current == enabled:
+            continue
+        try:
+            var.set(enabled)
+        except Exception:
+            continue
+        handler = getattr(gui, "_on_no_trick_toggle", None)
+        if callable(handler):
+            try:
+                handler()
+            except Exception:
+                pass
+
+
+def _manual_any_active():
+    if manual_firework_var is not None and manual_firework_var.get():
+        return True
+    if manual_line_var is not None and manual_line_var.get():
+        return True
+    return False
+
+
+def collapse_for_manual_mode():
+    global manual_collapse_active, manual_original_geometry
+    if root_window is None or toolbar_frame is None:
+        return
+    if manual_collapse_active:
+        return
+    root_window.update_idletasks()
+    manual_original_geometry = root_window.geometry()
+    if manual_previous_minsize is not None:
+        root_window.minsize(200, 120)
+    width = max(toolbar_frame.winfo_reqwidth() + 40, 360)
+    height = max(toolbar_frame.winfo_reqheight() + 20, 140)
+    try:
+        win = find_game_window()
+    except Exception:
+        win = None
+    if win is not None:
+        x = int(win.left)
+        y = int(max(0, win.top - height))
+    else:
+        x = max(root_window.winfo_rootx(), 0)
+        y = max(root_window.winfo_rooty() - height, 0)
+    root_window.geometry(f"{width}x{height}+{x}+{y}")
+    manual_collapse_active = True
+    if manual_expand_button is not None:
+        try:
+            manual_expand_button.state(["!disabled"])
+        except Exception:
+            pass
+
+
+def restore_main_window():
+    global manual_collapse_active
+    if root_window is None:
+        return
+    if manual_original_geometry:
+        root_window.geometry(manual_original_geometry)
+    if manual_previous_minsize is not None:
+        root_window.minsize(*manual_previous_minsize)
+    manual_collapse_active = False
+    if manual_expand_button is not None:
+        try:
+            manual_expand_button.state(["disabled"])
+        except Exception:
+            pass
+
+
+def on_manual_firework_toggle():
+    if manual_firework_var is None:
+        return
+    enabled = bool(manual_firework_var.get())
+    if enabled:
+        ensure_manual_firework_service().start()
+        set_firework_no_trick_enabled(True)
+        collapse_for_manual_mode()
+    else:
+        if manual_firework_service is not None:
+            manual_firework_service.stop()
+        if not _manual_any_active() and manual_collapse_active:
+            restore_main_window()
+
+
+def on_manual_line_toggle():
+    if manual_line_var is None:
+        return
+    enabled = bool(manual_line_var.get())
+    if enabled:
+        ensure_manual_line_service().start()
+        set_line_no_trick_enabled(True)
+        collapse_for_manual_mode()
+    else:
+        if manual_line_service is not None:
+            manual_line_service.stop()
+        if not _manual_any_active() and manual_collapse_active:
+            restore_main_window()
+
+
+
 def main():
-    global app, uid_mask_manager, xp50_app
+    global app, uid_mask_manager, xp50_app, root_window, toolbar_frame
+    global manual_firework_var, manual_line_var, manual_expand_button
+    global manual_previous_minsize
     cfg = load_config()
 
     root = tk.Tk()
     root.title("苏苏多功能自动化工具")
     start_ui_dispatch_loop(root)
     uid_mask_manager = UIDMaskManager(root)
+    root_window = root
 
     # 简单自适应分辨率 + DPI 缩放
     sw = root.winfo_screenwidth()
@@ -6566,10 +6879,14 @@ def main():
     pos_x = max((sw - win_w) // 2, 0)
     pos_y = max((sh - win_h) // 2, 0)
     root.geometry(f"{win_w}x{win_h}+{pos_x}+{pos_y}")
-    root.minsize(min(win_w, 1000), min(win_h, 650))
+    min_w = min(win_w, 1000)
+    min_h = min(win_h, 650)
+    root.minsize(min_w, min_h)
+    manual_previous_minsize = (min_w, min_h)
 
     toolbar = ttk.Frame(root)
     toolbar.pack(fill="x", padx=10, pady=5)
+    toolbar_frame = toolbar
     ttk.Button(toolbar, text="打开UID遮挡", command=lambda: uid_mask_manager.start()).pack(
         side="left", padx=4
     )
@@ -6577,12 +6894,48 @@ def main():
         side="left", padx=4
     )
 
+    manual_firework_var = tk.BooleanVar(value=False)
+    manual_line_var = tk.BooleanVar(value=False)
+
+    tk.Checkbutton(
+        toolbar,
+        text="单独开启转盘无巧手解密",
+        variable=manual_firework_var,
+        command=on_manual_firework_toggle,
+    ).pack(side="left", padx=4)
+    tk.Checkbutton(
+        toolbar,
+        text="单独开启划线无巧手解密",
+        variable=manual_line_var,
+        command=on_manual_line_toggle,
+    ).pack(side="left", padx=4)
+
+    manual_notice = tk.Label(
+        toolbar,
+        text=(
+            "因群有要求 现在 两种无巧手解密都可以单独打开 常驻后台 配合其他作者的脚本使用 打开后你就相当于巧手了：注意 划线无巧手解密速度很快没什么影响 但是转盘无巧手解密需要一点时间 你要自己设置好脚本的延迟 配合解密完成！"
+        ),
+        fg="red",
+        justify="left",
+        wraplength=420,
+    )
+    manual_notice.pack(side="left", padx=8)
+
+    manual_expand_button = ttk.Button(toolbar, text="展开界面", command=restore_main_window)
+    manual_expand_button.pack(side="left", padx=4)
+    try:
+        manual_expand_button.state(["disabled"])
+    except Exception:
+        pass
+
     notebook = ttk.Notebook(root)
     notebook.pack(fill="both", expand=True)
 
     frame_firework = ttk.Frame(notebook)
     notebook.add(frame_firework, text="赛琪大烟花")
     app = MainGUI(frame_firework, cfg)
+    if manual_firework_var is not None and manual_firework_var.get():
+        set_firework_no_trick_enabled(True)
 
     frame_xp50 = ttk.Frame(notebook)
     notebook.add(frame_xp50, text="全自动50人物经验副本")
@@ -6645,6 +6998,8 @@ def main():
         weapon_guard_frame: weapon_guard_gui,
         weapon_expel_frame: weapon_expel_gui,
     }
+    if manual_line_var is not None and manual_line_var.get():
+        set_line_no_trick_enabled(True)
 
     fragment_notebooks = [
         (frame_fragment, fragment_notebook),
@@ -6678,6 +7033,10 @@ def main():
     def on_close():
         if uid_mask_manager is not None:
             uid_mask_manager.stop(manual=False, silent=True)
+        if manual_firework_service is not None:
+            manual_firework_service.stop()
+        if manual_line_service is not None:
+            manual_line_service.stop()
         root.destroy()
 
     root.protocol("WM_DELETE_WINDOW", on_close)
