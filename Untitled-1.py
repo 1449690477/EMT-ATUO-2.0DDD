@@ -1125,31 +1125,20 @@ def play_segment_macro(path: str, label: str, progress_callback=None):
             ty = origin_y + target[1] * scale_y
 
             try:
-                steps = int(seg.get("steps", 50))
+                requested_duration = float(seg.get("duration", 0.0) or 0.0)
             except (TypeError, ValueError):
-                steps = 50
-            if steps <= 0:
-                delta = max(abs(tx - current_x), abs(ty - current_y))
-                steps = max(10, min(120, int(delta / 5) if delta > 0 else 10))
+                requested_duration = 0.0
+
+            distance = max(abs(tx - current_x), abs(ty - current_y))
+            if requested_duration <= 0:
+                duration = min(0.05, 0.015 + distance / 12000.0)
             else:
-                steps = max(10, min(steps, 200))
+                duration = max(0.0, min(requested_duration, 0.2))
 
-            move_failed = False
-            for step_index in range(1, steps + 1):
-                if worker_stop.is_set():
-                    move_failed = True
-                    break
-                nx = current_x + (tx - current_x) * step_index / steps
-                ny = current_y + (ty - current_y) * step_index / steps
-                try:
-                    pyautogui.moveTo(int(round(nx)), int(round(ny)))
-                except Exception as e:
-                    log(f"{label}：移动到第 {idx + 1} 段第 {step_index} 步失败：{e}")
-                    move_failed = True
-                    break
-                time.sleep(0.005)
-
-            if move_failed:
+            try:
+                pyautogui.moveTo(int(round(tx)), int(round(ty)), duration=duration)
+            except Exception as e:
+                log(f"{label}：移动到第 {idx + 1} 段终点失败：{e}")
                 break
 
             current_x = tx
@@ -1169,7 +1158,10 @@ def play_segment_macro(path: str, label: str, progress_callback=None):
                 log(f"{label} 回放进度：{percent}%（鼠标段:{executed_segments}）")
                 last_percent = percent
 
-            time.sleep(0.02)
+            if worker_stop.is_set():
+                break
+
+            time.sleep(0.005)
 
         else:
             # 循环未被 break，确保进度到 100%
@@ -5260,11 +5252,14 @@ class XP50AutoGUI:
 
     def _worker_loop(self, wait_seconds: float, auto_loop: bool, loop_limit: int):
         loops_done = 0
+        first_round_pending = True
         try:
             while not worker_stop.is_set():
                 loops_done += 1
                 log(f"===== {self.LOG_PREFIX} 新一轮开始 =====")
-                success = self._run_round(wait_seconds)
+                success = self._run_round(wait_seconds, first_round_pending)
+                if success and first_round_pending:
+                    first_round_pending = False
                 if worker_stop.is_set():
                     break
                 if not auto_loop:
@@ -5301,7 +5296,7 @@ class XP50AutoGUI:
         post_to_main_thread(_)
 
     # ---- 核心逻辑 ----
-    def _run_round(self, wait_seconds: float) -> bool:
+    def _run_round(self, wait_seconds: float, first_round: bool) -> bool:
         if worker_stop.is_set():
             return False
 
@@ -5310,33 +5305,48 @@ class XP50AutoGUI:
             self.set_status("初始化失败")
             return False
 
-        self.set_status("点击开始挑战（第一次）…")
-        if not xp50_wait_and_click(
-            XP50_START_TEMPLATE,
-            f"{self.LOG_PREFIX} 进入：开始挑战（第一次）",
-            25.0,
-            XP50_CLICK_THRESHOLD,
-        ):
-            self.set_status("未能点击开始挑战。")
-            return False
-        self.set_progress(5.0)
-        time.sleep(0.5)
-        if worker_stop.is_set():
-            return False
+        if first_round:
+            self.set_status("点击开始挑战（第一次）…")
+            if not xp50_wait_and_click(
+                XP50_START_TEMPLATE,
+                f"{self.LOG_PREFIX} 进入：开始挑战（第一次）",
+                25.0,
+                XP50_CLICK_THRESHOLD,
+            ):
+                self.set_status("未能点击开始挑战。")
+                return False
+            self.set_progress(5.0)
+            time.sleep(0.4)
+            if worker_stop.is_set():
+                return False
 
-        self.set_status("点击开始挑战（第二次）…")
-        if not xp50_wait_and_click(
-            XP50_START_TEMPLATE,
-            f"{self.LOG_PREFIX} 进入：开始挑战（第二次）",
-            20.0,
-            XP50_CLICK_THRESHOLD,
-        ):
-            self.set_status("第二次点击开始挑战失败。")
-            return False
-        self.set_progress(10.0)
-        time.sleep(0.5)
-        if worker_stop.is_set():
-            return False
+            self.set_status("点击开始挑战（第二次）…")
+            if not xp50_wait_and_click(
+                XP50_START_TEMPLATE,
+                f"{self.LOG_PREFIX} 进入：开始挑战（第二次）",
+                20.0,
+                XP50_CLICK_THRESHOLD,
+            ):
+                self.set_status("第二次点击开始挑战失败。")
+                return False
+            self.set_progress(10.0)
+            time.sleep(0.4)
+            if worker_stop.is_set():
+                return False
+        else:
+            self.set_status("点击再次开始挑战…")
+            if not xp50_wait_and_click(
+                XP50_START_TEMPLATE,
+                f"{self.LOG_PREFIX} 再次进入：开始挑战",
+                20.0,
+                XP50_CLICK_THRESHOLD,
+            ):
+                self.set_status("未能点击再次开始挑战。")
+                return False
+            self.set_progress(10.0)
+            time.sleep(0.4)
+            if worker_stop.is_set():
+                return False
 
         chosen = None
         scores = {label: 0.0 for label in XP50_MAP_TEMPLATES}
