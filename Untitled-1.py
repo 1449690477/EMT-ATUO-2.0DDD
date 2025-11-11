@@ -6676,6 +6676,7 @@ class HS70AutoGUI:
     ENTRY_DELAY = 0.4
     INITIAL_MAP_THRESHOLD = 0.7
     BRANCH_A_THRESHOLD = 0.82
+    BRANCH_A_TIMEOUT = 1.2
     VARIATION_THRESHOLD = 0.82
     MARK_THRESHOLD = 0.82
     MARK_CONFIRMATIONS = 2
@@ -7247,6 +7248,20 @@ class HS70AutoGUI:
             if worker_stop.is_set():
                 return False
         else:
+            retry_path = hs_find_asset(HS_RETRY_TEMPLATE, allow_templates=True)
+            if not retry_path:
+                log(f"{self.LOG_PREFIX} 缺少 {HS_RETRY_TEMPLATE}，无法点击再次进行。")
+                self.set_status("缺少 再次进行.png")
+                return False
+
+            self.set_status("点击再次进行…")
+            if not self._click_template_from_path(retry_path, "再次进行"):
+                self.set_status("未能点击再次进行。")
+                return False
+            self._sleep_with_check(0.35)
+            if worker_stop.is_set():
+                return False
+
             self.set_status("点击开始挑战…")
             if not hs_wait_and_click_template(
                 HS_START_TEMPLATE,
@@ -7353,7 +7368,7 @@ class HS70AutoGUI:
             return False
 
         self.set_status("匹配分支A…")
-        deadline = time.time() + 10.0
+        deadline = time.time() + self.BRANCH_A_TIMEOUT
         best = 0.0
         while time.time() < deadline and not worker_stop.is_set():
             score, _, _ = match_template_from_path(path)
@@ -7362,7 +7377,7 @@ class HS70AutoGUI:
             if score >= self.BRANCH_A_THRESHOLD:
                 self.set_detail("分支A匹配成功。")
                 return True
-            time.sleep(0.3)
+            time.sleep(0.1)
 
         log(
             f"{self.LOG_PREFIX} 分支A 匹配失败，最高 {best:.3f} < {self.BRANCH_A_THRESHOLD:.2f}，执行防卡死。"
