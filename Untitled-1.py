@@ -7454,9 +7454,41 @@ class HS70AutoGUI:
                         if pause_time:
                             continue
                         time.sleep(0.05)
+
+                if require_decrypt and controller.executed_macros > executed_before:
+                    log(f"{self.LOG_PREFIX} 解密已触发，等待解密宏执行完成…")
+                    max_decrypt_wait = 30.0
+                    decrypt_start = time.time()
+
+                    while (
+                        time.time() - decrypt_start < max_decrypt_wait
+                        and not worker_stop.is_set()
+                    ):
+                        pause_time = controller.run_decrypt_if_needed()
+
+                        if getattr(controller, "session_completed", False):
+                            log(f"{self.LOG_PREFIX} 解密宏已完成。")
+                            break
+
+                        if not getattr(controller, "session_started", True):
+                            log(f"{self.LOG_PREFIX} 解密会话已结束。")
+                            break
+
+                        if pause_time:
+                            continue
+
+                        time.sleep(0.05)
+
+                    if controller.executed_macros > executed_before:
+                        log(
+                            f"{self.LOG_PREFIX} 解密完成后等待 {self.DECRYPT_EXTRA_DELAY:.1f} 秒稳定…"
+                        )
+                        wait_after_decrypt_delay(self.DECRYPT_EXTRA_DELAY)
+
                 elif require_decrypt:
                     # 避免遗漏延迟识别导致的残留任务
                     controller.run_decrypt_if_needed()
+
                 decrypted = controller.executed_macros > executed_before
                 decrypt_triggered = decrypted
                 controller.stop()
@@ -7465,7 +7497,6 @@ class HS70AutoGUI:
                     self.no_trick_controller = None
             if require_decrypt:
                 if decrypt_triggered:
-                    wait_after_decrypt_delay(self.DECRYPT_EXTRA_DELAY)
                     self.last_decrypt_completed_at = time.time()
                     self.expect_marker_after_decrypt = True
                     self.pending_marker_scan = True
