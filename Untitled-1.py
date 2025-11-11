@@ -2875,6 +2875,7 @@ class NoTrickDecryptController:
         self.templates = []
         self.thread = None
         self.session_started = False
+        self.macro_done_event = threading.Event()
 
     def _log(self, message: str):
         if getattr(self.gui, "suppress_log", False):
@@ -2901,6 +2902,7 @@ class NoTrickDecryptController:
         self.macro_missing = False
         self.executed_macros = 0
         self.session_started = True
+        self.macro_done_event.clear()
         self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.thread.start()
         self.gui.on_no_trick_monitor_started(self.templates)
@@ -2909,6 +2911,7 @@ class NoTrickDecryptController:
     def stop(self):
         self.stop_event.set()
         self.session_started = False
+        self.macro_done_event.set()
 
     def finish_session(self):
         if self.thread and self.thread.is_alive():
@@ -2918,6 +2921,7 @@ class NoTrickDecryptController:
             except Exception:
                 pass
         self.session_started = False
+        self.macro_done_event.set()
         self.gui.on_no_trick_session_finished(
             triggered=self.detected_entry is not None,
             macro_executed=self.macro_executed,
@@ -2944,6 +2948,7 @@ class NoTrickDecryptController:
             self._log(f"{self.gui.log_prefix} 无巧手解密：缺少对应宏文件 {macro_path}")
             self.macro_missing = True
             self.gui.on_no_trick_macro_missing(entry)
+            self.macro_done_event.set()
             return 0.0
 
         restore_keys = None
@@ -2957,6 +2962,7 @@ class NoTrickDecryptController:
         # 重置执行标记，之前因为复用上一轮的 True 状态，会让等待环节误以为解密已经完成。
         # 这里清零后，HS70 的解密判定会一直阻塞到当前宏真正播放完毕。
         self.macro_executed = False
+        self.macro_done_event.clear()
 
         start = time.perf_counter()
         self.gui.on_no_trick_macro_start(entry, score)
@@ -3004,9 +3010,14 @@ class NoTrickDecryptController:
             self.gui.on_no_trick_macro_complete(entry)
             wait_after_decrypt_delay()
             end = time.perf_counter()
+            self.macro_done_event.set()
             return max(0.0, end - start)
 
+        self.macro_done_event.set()
         return 0.0
+
+    def wait_for_completion(self, timeout: Optional[float] = None) -> bool:
+        return self.macro_done_event.wait(timeout)
 
     def _monitor_loop(self):
         while not self.stop_event.is_set() and not worker_stop.is_set():
@@ -3108,6 +3119,7 @@ class FireworkNoTrickController:
         self.active = False
         self.thread = None
         self.verifying_completion = False
+        self.macro_done_event = threading.Event()
 
     def _log(self, message: str):
         if getattr(self.gui, "suppress_log", False):
@@ -3142,6 +3154,7 @@ class FireworkNoTrickController:
         self.session_completed = False
         self.session_started = True
         self.verifying_completion = False
+        self.macro_done_event.clear()
         self.thread = threading.Thread(target=self._monitor_loop, daemon=True)
         self.thread.start()
         try:
@@ -3153,6 +3166,7 @@ class FireworkNoTrickController:
     def stop(self):
         self.stop_event.set()
         self.session_started = False
+        self.macro_done_event.set()
 
     def finish_session(self):
         if self.thread and self.thread.is_alive():
@@ -3235,6 +3249,7 @@ class FireworkNoTrickController:
                 self.gui.on_no_trick_macro_missing(entry)
             except Exception:
                 pass
+            self.macro_done_event.set()
             return 0.0
 
         restore_keys = None
@@ -3250,6 +3265,7 @@ class FireworkNoTrickController:
             pass
 
         start = time.perf_counter()
+        self.macro_done_event.clear()
 
         def progress_cb(p):
             try:
@@ -3288,6 +3304,8 @@ class FireworkNoTrickController:
             self.gui.on_no_trick_macro_complete(entry)
         except Exception:
             pass
+
+        self.macro_done_event.set()
 
         end = time.perf_counter()
         return max(0.0, end - start)
@@ -3395,6 +3413,7 @@ class FireworkNoTrickController:
             self.active = False
             self.last_wait_notify = 0.0
         self.stop_event.set()
+        self.macro_done_event.set()
 
     def was_stuck(self) -> bool:
         return False
@@ -6694,6 +6713,7 @@ class HS70AutoGUI:
     BRANCH_SCAN_INTERVAL = 0.25
     DECRYPT_EXTRA_DELAY = 0.5
     DECRYPT_APPEAR_TIMEOUT = 2.0
+    DECRYPT_COMPLETE_TIMEOUT = 30.0
     TARGET_THRESHOLD = 0.8
     TARGET_SCAN_INTERVAL = 0.05
     TARGET_PAUSE = 2.0
@@ -7410,6 +7430,26 @@ class HS70AutoGUI:
     def _macro_requires_decrypt(self, macro_name: str) -> bool:
         return "开锁" in macro_name and "校准" not in macro_name
 
+    def _pump_decrypt_until(
+        self,
+        controller,
+        predicate,
+        timeout: Optional[float],
+    ) -> bool:
+        deadline = time.time() + timeout if timeout is not None else None
+        while True:
+            if predicate():
+                return True
+            if worker_stop.is_set():
+                return False
+            pause_time = controller.run_decrypt_if_needed()
+            if predicate():
+                return True
+            if deadline is not None and time.time() >= deadline:
+                return predicate()
+            if not pause_time:
+                time.sleep(0.05)
+
     def _run_macro_with_decrypt(
         self,
         macro_name: str,
@@ -7446,6 +7486,7 @@ class HS70AutoGUI:
             self.set_progress(percent)
 
         decrypt_triggered = False
+        decrypt_completed = False
         try:
             executed = play_macro(
                 macro_path,
@@ -7458,62 +7499,51 @@ class HS70AutoGUI:
             )
         finally:
             if controller is not None:
-                if require_decrypt and controller.executed_macros <= executed_before:
-                    log(
-                        f"{self.LOG_PREFIX} 等待解密图案出现（最多 {self.DECRYPT_APPEAR_TIMEOUT:.1f} 秒）…"
-                    )
-                    deadline = time.time() + self.DECRYPT_APPEAR_TIMEOUT
-                    while (
-                        controller.executed_macros <= executed_before
-                        and time.time() < deadline
-                        and not worker_stop.is_set()
-                    ):
-                        pause_time = controller.run_decrypt_if_needed()
-                        if controller.executed_macros > executed_before:
-                            break
-                        if pause_time:
-                            continue
-                        time.sleep(0.05)
-
-                if require_decrypt and controller.executed_macros > executed_before:
-                    log(f"{self.LOG_PREFIX} 解密已触发，等待解密宏执行完成…")
-                    max_decrypt_wait = 30.0
-                    decrypt_start = time.time()
-
-                    while (
-                        time.time() - decrypt_start < max_decrypt_wait
-                        and not worker_stop.is_set()
-                    ):
-                        pause_time = controller.run_decrypt_if_needed()
-
-                        if getattr(controller, "session_completed", False):
-                            log(f"{self.LOG_PREFIX} 解密宏已完成。")
-                            break
-
-                        if not getattr(controller, "session_started", True):
-                            log(f"{self.LOG_PREFIX} 解密会话已结束。")
-                            break
-
-                        if getattr(controller, "macro_executed", False):
-                            log(f"{self.LOG_PREFIX} 解密宏已完成。")
-                            break
-
-                        if pause_time:
-                            continue
-
-                        time.sleep(0.05)
-
+                triggered = False
+                completed = False
+                if require_decrypt:
                     if controller.executed_macros > executed_before:
+                        triggered = True
+                    else:
                         log(
-                            f"{self.LOG_PREFIX} 解密完成后等待 {self.DECRYPT_EXTRA_DELAY:.1f} 秒稳定…"
+                            f"{self.LOG_PREFIX} 等待解密图案出现（最多 {self.DECRYPT_APPEAR_TIMEOUT:.1f} 秒）…"
                         )
-                        wait_after_decrypt_delay(self.DECRYPT_EXTRA_DELAY)
-                elif require_decrypt:
-                    # 避免遗漏延迟识别导致的残留任务
-                    controller.run_decrypt_if_needed()
+                        triggered = self._pump_decrypt_until(
+                            controller,
+                            lambda: controller.executed_macros > executed_before,
+                            self.DECRYPT_APPEAR_TIMEOUT,
+                        )
 
-                decrypted = controller.executed_macros > executed_before
-                decrypt_triggered = decrypted
+                    if triggered:
+                        log(f"{self.LOG_PREFIX} 解密已触发，等待解密宏执行完成…")
+                        event = getattr(controller, "macro_done_event", None)
+                        if event is not None:
+                            predicate = event.is_set
+                        else:
+                            predicate = lambda: getattr(controller, "macro_executed", False)
+                        completed = self._pump_decrypt_until(
+                            controller,
+                            predicate,
+                            self.DECRYPT_COMPLETE_TIMEOUT,
+                        )
+                        if completed:
+                            log(f"{self.LOG_PREFIX} 解密宏已完成。")
+                            if self.DECRYPT_EXTRA_DELAY > 0:
+                                log(
+                                    f"{self.LOG_PREFIX} 解密完成后等待 {self.DECRYPT_EXTRA_DELAY:.1f} 秒稳定…"
+                                )
+                                wait_after_decrypt_delay(self.DECRYPT_EXTRA_DELAY)
+                        else:
+                            log(
+                                f"{self.LOG_PREFIX} 解密宏未在 {self.DECRYPT_COMPLETE_TIMEOUT:.1f} 秒内完成。"
+                            )
+                    else:
+                        log(
+                            f"{self.LOG_PREFIX} 在 {self.DECRYPT_APPEAR_TIMEOUT:.1f} 秒内未检测到解密图案。"
+                        )
+
+                decrypt_triggered = triggered
+                decrypt_completed = completed if triggered else False
                 controller.stop()
                 controller.finish_session()
                 if self.no_trick_controller is controller:
@@ -7521,14 +7551,23 @@ class HS70AutoGUI:
                 if require_decrypt and not worker_stop.is_set():
                     self._prime_no_trick_controller()
 
-        if require_decrypt and not decrypt_triggered:
-            log(
-                f"{self.LOG_PREFIX} {macro_name} 执行后未在 {self.DECRYPT_APPEAR_TIMEOUT:.1f} 秒内触发解密，执行防卡死。"
-            )
-            self.set_status("解密未触发，执行防卡死…")
-            self.set_detail("2 秒内未检测到解密图案。")
-            self._perform_retry_recover()
-            return False
+        if require_decrypt:
+            if not decrypt_triggered:
+                log(
+                    f"{self.LOG_PREFIX} {macro_name} 执行后未在 {self.DECRYPT_APPEAR_TIMEOUT:.1f} 秒内触发解密，执行防卡死。"
+                )
+                self.set_status("解密未触发，执行防卡死…")
+                self.set_detail("2 秒内未检测到解密图案。")
+                self._perform_retry_recover()
+                return False
+            if not decrypt_completed:
+                log(
+                    f"{self.LOG_PREFIX} {macro_name} 的解密宏未在 {self.DECRYPT_COMPLETE_TIMEOUT:.1f} 秒内完成，执行防卡死。"
+                )
+                self.set_status("解密超时，执行防卡死…")
+                self.set_detail("解密宏执行超时。")
+                self._perform_retry_recover()
+                return False
 
         if executed:
             if end:
