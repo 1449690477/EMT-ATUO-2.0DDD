@@ -6730,6 +6730,7 @@ class HS70AutoGUI:
         self.entry_prepared = False
         self.last_decrypt_completed_at = 0.0
         self.expect_marker_after_decrypt = False
+        self.pending_marker_scan = False
 
         self._build_ui()
         self._update_no_trick_ui()
@@ -7467,11 +7468,14 @@ class HS70AutoGUI:
                     wait_after_decrypt_delay(self.DECRYPT_EXTRA_DELAY)
                     self.last_decrypt_completed_at = time.time()
                     self.expect_marker_after_decrypt = True
+                    self.pending_marker_scan = True
                 else:
                     self.last_decrypt_completed_at = 0.0
                     self.expect_marker_after_decrypt = False
+                    self.pending_marker_scan = False
             else:
                 self.expect_marker_after_decrypt = False
+                self.pending_marker_scan = False
 
         if require_decrypt and not decrypt_triggered:
             log(
@@ -7487,6 +7491,7 @@ class HS70AutoGUI:
                 self.set_progress(end)
             return True
         self.expect_marker_after_decrypt = False
+        self.pending_marker_scan = False
         return False
 
     def _check_marker(self) -> bool:
@@ -7495,10 +7500,8 @@ class HS70AutoGUI:
             log(f"{self.LOG_PREFIX} 缺少 {HS_MARK_TEMPLATE}")
             return False
 
-        if self.expect_marker_after_decrypt and self.last_decrypt_completed_at > 0:
-            deadline = self.last_decrypt_completed_at + self.MARK_START_DELAY
-            while time.time() < deadline and not worker_stop.is_set():
-                time.sleep(0.01)
+        if not self._prepare_marker_scan():
+            return False
 
         log(
             f"{self.LOG_PREFIX} 开始检测标记.png，阈值 {self.MARK_THRESHOLD:.2f}，需连续"
@@ -7523,6 +7526,7 @@ class HS70AutoGUI:
                     )
                     self.set_detail("识别到标记，执行校准宏。")
                     self.expect_marker_after_decrypt = False
+                    self.pending_marker_scan = False
                     return True
                 time.sleep(self.MARK_CONFIRM_DELAY)
                 continue
@@ -7534,7 +7538,34 @@ class HS70AutoGUI:
         )
         self.set_detail(f"未识别到标记（最高 {best:.3f}）。")
         self.expect_marker_after_decrypt = False
+        self.pending_marker_scan = False
         return False
+
+    def _prepare_marker_scan(self) -> bool:
+        if not self.pending_marker_scan:
+            log(f"{self.LOG_PREFIX} 当前未记录到解密完成，跳过标记检测。")
+            self.expect_marker_after_decrypt = False
+            return False
+
+        if self.expect_marker_after_decrypt and self.last_decrypt_completed_at > 0:
+            deadline = self.last_decrypt_completed_at + self.MARK_START_DELAY
+            while time.time() < deadline and not worker_stop.is_set():
+                time.sleep(0.01)
+        else:
+            wait_deadline = time.time() + self.DECRYPT_APPEAR_TIMEOUT
+            while (
+                time.time() < wait_deadline
+                and not worker_stop.is_set()
+                and self.last_decrypt_completed_at <= 0
+            ):
+                time.sleep(0.05)
+            if self.last_decrypt_completed_at <= 0:
+                log(f"{self.LOG_PREFIX} 未检测到解密完成时间，跳过标记检测。")
+                self.expect_marker_after_decrypt = False
+                self.pending_marker_scan = False
+                return False
+
+        return True
 
     def _scan_branch_variation(self) -> bool:
         self.set_status("识别二阶段分支…")
